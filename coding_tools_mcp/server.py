@@ -1371,6 +1371,15 @@ class Runtime:
 
     def initialize(self, client_info: dict[str, Any] | None = None) -> dict[str, Any]:
         self.telemetry.record_session_start(client_info, self.protocol_version)
+        return self.initialize_result()
+
+    def initialize_result(self) -> dict[str, Any]:
+        """Build the handshake payload without recording a new session.
+
+        Replaying a duplicate initialize uses this so the telemetry session
+        count stays tied to real sessions.
+        """
+
         return {
             "protocolVersion": self.protocol_version,
             "capabilities": {"tools": {"listChanged": False}},

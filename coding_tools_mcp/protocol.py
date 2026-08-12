@@ -93,13 +93,26 @@ def dispatch_rpc(runtime: Any, request: dict[str, Any]) -> dict[str, Any] | None
         if not runtime.initialized and method not in {"initialize", "ping"}:
             raise JsonRpcError(-32002, "Server not initialized")
         if method == "initialize":
-            if runtime.initialized:
-                raise JsonRpcError(-32600, "Server is already initialized")
             validate_initialize_request(request)
-            runtime.protocol_version = validate_initialize_params(params)
-            client_info = params.get("clientInfo")
-            result = runtime.initialize(client_info if isinstance(client_info, dict) else None)
-            runtime.initialized = True
+            negotiated_version = validate_initialize_params(params)
+            if runtime.initialized:
+                # Some connectors send a second initialize on one persistent
+                # STDIO process. Rejecting it fails their tool scan even though
+                # the session is healthy, so replay the negotiated handshake
+                # instead. The initializer is not run again, so no session
+                # state is reset by a repeat.
+                if negotiated_version != runtime.protocol_version:
+                    raise JsonRpcError(
+                        -32600,
+                        "Server is already initialized with a different protocol version",
+                        {"expected": runtime.protocol_version, "received": negotiated_version},
+                    )
+                result = runtime.initialize_result()
+            else:
+                runtime.protocol_version = negotiated_version
+                client_info = params.get("clientInfo")
+                result = runtime.initialize(client_info if isinstance(client_info, dict) else None)
+                runtime.initialized = True
         elif method == "notifications/initialized":
             return None
         elif method == "notifications/cancelled":

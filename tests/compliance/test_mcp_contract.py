@@ -1000,6 +1000,59 @@ class MCPContractTests(ComplianceTestCase):
         finally:
             self.stop_process(process)
 
+    def test_stdio_replays_duplicate_initialize_after_discovery_probe(self) -> None:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "coding_tools_mcp",
+                "--workspace",
+                str(self.workspace.root),
+                "--stdio",
+            ],
+            cwd=str(self.workspace.root),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.server_process_env(),
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            discovery = self.stdio_rpc_allow_error(
+                process,
+                {"jsonrpc": "2.0", "id": "openai-mcp-discover", "method": "server/discover", "params": {}},
+            )
+            self.assertIn("error", discovery)
+            self.assertIsNone(process.poll(), "stdio server must stay alive after an unknown discovery probe")
+
+            initialize_params = {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "contract-duplicate-initialize", "version": "0.1"},
+            }
+            first = self.stdio_rpc(
+                process,
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": initialize_params},
+            )
+            self.assertEqual(first.get("result", {}).get("protocolVersion"), "2025-11-25")
+
+            replayed = self.stdio_rpc(
+                process,
+                {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": initialize_params},
+            )
+            self.assertEqual(replayed.get("result"), first.get("result"))
+
+            self.stdio_send(process, {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+            self.assert_no_stdio_response(process)
+
+            listed = self.stdio_rpc(process, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+            tools = listed.get("result", {}).get("tools")
+            self.assertIsInstance(tools, list)
+            self.assertTrue({tool.get("name") for tool in tools} >= set(REQUIRED_TOOLS))
+        finally:
+            self.stop_process(process)
+
     def assert_content_text_is_agent_readable(self, result: dict[str, Any]) -> str:
         structured = result.get("structuredContent")
         self.assertIsInstance(structured, dict, f"structuredContent must be an object: {result!r}")
