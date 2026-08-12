@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.3 - 2026-08-12
+
+### Fixed
+
+- A repeated `initialize` on one persistent STDIO session now replays the
+  negotiated handshake result instead of failing with `-32600 Server is
+  already initialized`. The initializer does not run again, so no session
+  state is reset and no second telemetry session is recorded. Connectors that
+  send `initialize` twice on the same process — the OpenAI Secure MCP Tunnel
+  probes with `server/discover` and then initializes twice — had their tool
+  scan aborted, surfacing as HTTP 424, even though the session was healthy
+  (issue #39).
+
 ## 0.2.2 - 2026-07-28
 
 ### Fixed
