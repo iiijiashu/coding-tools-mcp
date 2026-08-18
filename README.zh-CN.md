@@ -76,7 +76,7 @@ Gemini CLI 或 Cline——各家的 JSON 配置完全相同（偏好 Node 的话
 **2. 随时随地连回自己的电脑写代码。**
 
 ```bash
-CODING_TOOLS_MCP_AUTH_MODE=bearer ./scripts/tunnel.sh cloudflared /path/to/repo
+CODING_TOOLS_MCP_AUTH_MODE=bearer ./integrations/tunnels/tunnel.sh cloudflared /path/to/repo
 ```
 
 回环地址绑定 + 带认证的 HTTPS 隧道（`cloudflared`、`ngrok` 或 Microsoft Dev

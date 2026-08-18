@@ -85,7 +85,7 @@ commit-review a real repository.
 **2. Code on your own machine from anywhere.**
 
 ```bash
-CODING_TOOLS_MCP_AUTH_MODE=bearer ./scripts/tunnel.sh cloudflared /path/to/repo
+CODING_TOOLS_MCP_AUTH_MODE=bearer ./integrations/tunnels/tunnel.sh cloudflared /path/to/repo
 ```
 
 Loopback bind + authenticated HTTPS tunnel (`cloudflared`, `ngrok`, or
