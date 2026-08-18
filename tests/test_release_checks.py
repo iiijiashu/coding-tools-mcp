@@ -21,14 +21,14 @@ class ReleaseMetadataTests(unittest.TestCase):
         changelog: str = "# Changelog\n\n## 0.2.0 - 2026-07-24\n",
     ) -> None:
         (root / "coding_tools_mcp").mkdir(parents=True)
-        (root / "npm" / "coding-tools-mcp").mkdir(parents=True)
+        (root / "packages" / "npm-launcher").mkdir(parents=True)
         (root / "pyproject.toml").write_text(
             f'[project]\nversion = "{project_version}"\n', encoding="utf-8"
         )
         (root / "coding_tools_mcp" / "__init__.py").write_text(
             f'__version__ = "{module_version}"\n', encoding="utf-8"
         )
-        (root / "npm" / "coding-tools-mcp" / "package.json").write_text(
+        (root / "packages" / "npm-launcher" / "package.json").write_text(
             json.dumps({"version": npm_version}), encoding="utf-8"
         )
         (root / "CHANGELOG.md").write_text(changelog, encoding="utf-8")
