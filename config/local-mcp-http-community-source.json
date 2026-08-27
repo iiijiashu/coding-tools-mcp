@@ -1,0 +1,20 @@
+{
+  "log_file": "C:/Users/17918/.local/state/tunnel-client/logs/local-community-search-source-mcp-http.log",
+  "server_args": [
+    "--workspace",
+    "C:/Users/17918/Documents/Codex/2026-08-09/community-search-bridge",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "18766",
+    "--permission-mode",
+    "trusted",
+    "--read-root",
+    "C:/Users/17918/AppData",
+    "--read-root",
+    "D:/coding-tools-mcp",
+    "--outside-read-policy",
+    "request",
+    "--enable-computer-use"
+  ]
+}

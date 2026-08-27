@@ -1,0 +1,22 @@
+{
+  "log_file": "C:/Users/17918/.local/state/tunnel-client/logs/local-d-drive-coding-tools-mcp-http.log",
+  "server_args": [
+    "--workspace",
+    "D:/coding-tools-mcp",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "18765",
+    "--permission-mode",
+    "trusted",
+    "--read-root",
+    "C:/Users/17918/.zcode",
+    "--read-root",
+    "C:/Users/17918/AppData",
+    "--read-root",
+    "C:/Users/17918/Documents/Codex",
+    "--outside-read-policy",
+    "request",
+    "--enable-computer-use"
+  ]
+}

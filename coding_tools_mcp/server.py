@@ -32,6 +32,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 from . import __version__
+from . import computer as computer_tools
 from .envutils import ENV_PREFIX, truthy_env
 from .errors import JsonRpcError, ToolFailure
 from .landlock_exec import libc_syscall
@@ -62,6 +63,7 @@ from .processes import (
     COMMAND_BUFFER_BYTES,
     COMMAND_HEAD_BUFFER_DIVISOR,
     CommandRun,
+    hidden_process_popen_kwargs,
     spawn_process,
     start_reader_threads,
     start_command_watchdog,
@@ -87,7 +89,7 @@ from .protocol import (
 )
 from .project_context import ProjectContext, load_project_context
 from .telemetry import SessionTelemetry
-from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_head
+from .textutils import DEFAULT_MAX_LINES, TextTruncation, decode_output_bytes, truncate_text_head
 from .tool_results import make_tool_result
 from .transport_stdio import serve_stdio
 
@@ -143,6 +145,7 @@ class ModeCapabilities:
     landlock: bool
     secret_env_filter: bool
     global_tmp_write: str  # "blocked" | "tmp-prefix" | "allowed"
+    computer_control: bool
     skip_all_permissions: bool
 
 
@@ -154,6 +157,7 @@ PERMISSION_MODE_CAPABILITIES: dict[str, ModeCapabilities] = {
         landlock=True,
         secret_env_filter=True,
         global_tmp_write="blocked",
+        computer_control=False,
         skip_all_permissions=False,
     ),
     "trusted": ModeCapabilities(
@@ -163,6 +167,7 @@ PERMISSION_MODE_CAPABILITIES: dict[str, ModeCapabilities] = {
         landlock=True,
         secret_env_filter=True,
         global_tmp_write="tmp-prefix",
+        computer_control=True,
         skip_all_permissions=False,
     ),
     "dangerous": ModeCapabilities(
@@ -172,6 +177,7 @@ PERMISSION_MODE_CAPABILITIES: dict[str, ModeCapabilities] = {
         landlock=False,
         secret_env_filter=False,
         global_tmp_write="allowed",
+        computer_control=True,
         skip_all_permissions=True,
     ),
 }
@@ -189,6 +195,7 @@ NETWORK_RE = re.compile(
     re.I,
 )
 SHELL_EXPANSION_RE = re.compile(r"(`|\$\(|\$\{)")
+WINDOWS_SHELL_EXPANSION_RE = re.compile(r"%[^%\r\n]+%|![^!\r\n]+!|\^")
 DESTRUCTIVE_RE = re.compile(
     r"(^|\s)(sudo|su|chmod\s+-R|chown\s+-R|mkfs|mount|umount|find\b[^;&|]*\s-delete\b|git\b[^;&|]*\breset\s+--hard\b|git\b[^;&|]*\bclean\s+-[^\s]*[fx][^\s]*|rm\s+-[^\s]*r[^\s]*f|rm\s+-[^\s]*f[^\s]*r)\b",
     re.I,
@@ -219,6 +226,129 @@ _COMMAND_RECOVERY_HINT = (
     " same command_id cannot succeed. Start the work again with exec_command and"
     " use the command_id it returns."
 )
+
+
+class HTTPInstanceConflict(RuntimeError):
+    def __init__(self, owner: dict[str, Any]) -> None:
+        super().__init__("another Coding Tools MCP instance owns this HTTP endpoint")
+        self.owner = owner
+
+
+class HTTPInstanceLease:
+    """Kernel-backed single-owner lease with non-secret diagnostic metadata."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        workspace: Path,
+        *,
+        state_root: Path | None = None,
+    ) -> None:
+        default_root = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+        self.state_root = (state_root or default_root / "CodingToolsMCP" / "instances").resolve()
+        identity = hashlib.sha256(f"{host}:{port}".encode("utf-8")).hexdigest()[:20]
+        self.lock_path = self.state_root / f"http-{identity}.lock"
+        self.metadata_path = self.state_root / f"http-{identity}.json"
+        self.host = host
+        self.port = int(port)
+        self.workspace = workspace.expanduser().resolve(strict=True)
+        self.pid = os.getpid()
+        self.generation = secrets.token_urlsafe(12)
+        self._stream: Any = None
+
+    def _lock(self) -> None:
+        assert self._stream is not None
+        self._stream.seek(0, os.SEEK_END)
+        if self._stream.tell() < 1:
+            self._stream.write(b"0")
+            self._stream.flush()
+        self._stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(self._stream.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self._stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock(self) -> None:
+        assert self._stream is not None
+        self._stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(self._stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
+
+    def _read_owner(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return {"host": self.host, "port": self.port, "state": "owner_metadata_pending"}
+        return payload if isinstance(payload, dict) else {"host": self.host, "port": self.port}
+
+    def acquire(self) -> None:
+        if self._stream is not None:
+            raise RuntimeError("HTTP instance lease is already acquired")
+        self.state_root.mkdir(parents=True, exist_ok=True)
+        stream = self.lock_path.open("a+b")
+        self._stream = stream
+        try:
+            self._lock()
+        except OSError as exc:
+            owner = self._read_owner()
+            stream.close()
+            self._stream = None
+            raise HTTPInstanceConflict(owner) from exc
+        metadata = {
+            "state": "STARTING",
+            "generation": self.generation,
+            "pid": self.pid,
+            "host": self.host,
+            "port": self.port,
+            "workspace": str(self.workspace),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        temporary = self.metadata_path.with_name(self.metadata_path.name + f".{self.pid}.tmp")
+        temporary.write_text(json.dumps(metadata, ensure_ascii=True, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, self.metadata_path)
+
+    def mark_ready(self, runtime: "Runtime") -> None:
+        payload = {
+            "state": "READY",
+            "generation": self.generation,
+            "pid": self.pid,
+            "host": self.host,
+            "port": self.port,
+            "workspace": str(self.workspace),
+            "server_instance_id": runtime.server_instance_id,
+            "catalog_version": runtime.catalog_version,
+            "tool_count": len(runtime.exposed_tool_names()),
+            "started_at": runtime.started_at,
+        }
+        temporary = self.metadata_path.with_name(self.metadata_path.name + f".{self.pid}.tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=True, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, self.metadata_path)
+
+    def release(self) -> None:
+        if self._stream is None:
+            return
+        try:
+            owner = self._read_owner()
+            if owner.get("generation") == self.generation:
+                try:
+                    self.metadata_path.unlink()
+                except FileNotFoundError:
+                    pass
+            self._unlock()
+        finally:
+            self._stream.close()
+            self._stream = None
 SHELL_CONTROL_TOKENS = {"|", "||", "&", "&&", ";", "(", ")"}
 REDIRECTION_TOKENS = {">", ">>", "<", "<>", ">&", "<&", "&>", "&>>"}
 HEREDOC_TOKENS = {"<<", "<<<"}
@@ -229,6 +359,10 @@ PATH_ARGUMENT_COMMANDS = {
     "chmod",
     "chown",
     "cp",
+    "copy",
+    "del",
+    "dir",
+    "erase",
     "head",
     "less",
     "ln",
@@ -236,15 +370,41 @@ PATH_ARGUMENT_COMMANDS = {
     "mkdir",
     "more",
     "mv",
+    "move",
+    "pushd",
+    "rd",
+    "ren",
+    "rename",
     "rm",
     "rmdir",
+    "robocopy",
     "stat",
     "tail",
     "touch",
+    "type",
     "wc",
+    "xcopy",
 }
-PATTERN_THEN_PATH_COMMANDS = {"grep", "egrep", "fgrep", "rg", "sed", "awk"}
+PATTERN_THEN_PATH_COMMANDS = {"grep", "egrep", "fgrep", "rg", "sed", "awk", "findstr"}
 SCRIPT_COMMANDS = {"bash", "sh", "zsh", "python", "python3", "node", "ruby", "perl"}
+WINDOWS_COMMAND_SHELLS = {"cmd", "cmd.exe", "command", "command.com"}
+WINDOWS_COMMAND_TOKEN_RE = re.compile(
+    r"(?:^|/)(?P<name>cmd(?:\.exe)?|command(?:\.com)?)(?P<options>(?:/[^/]*)*)$",
+    re.I,
+)
+WINDOWS_COMMAND_WRAPPERS = {"call", "for", "forfiles", "if", "start"}
+WINDOWS_SCRIPT_HOSTS = {
+    "cscript",
+    "cscript.exe",
+    "mshta",
+    "mshta.exe",
+    "powershell",
+    "powershell.exe",
+    "pwsh",
+    "pwsh.exe",
+    "wscript",
+    "wscript.exe",
+}
 ENV_OPTIONS_WITH_ARGUMENT = {
     "-u",
     "--unset",
@@ -655,6 +815,7 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         title="Execute command",
         description=(
             "Run a bounded command under runtime policy. Pass workdir explicitly for reconnect-safe paths. "
+            "Set interactive=true to keep a pipe-backed stdin open when tty is unavailable. "
             "A still-running command returns command_id. Example: "
             "{\"cmd\":\"pytest -q\",\"workdir\":\".\",\"yield_time_ms\":30000}. "
             "Retained output is bounded per stream; for very large output redirect to a file "
@@ -732,6 +893,44 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         idempotent=True,
         content_builder=_image_content,
         gated_by="enable_view_image",
+    ),
+    "computer_screenshot": ToolSpec(
+        title="Computer screenshot",
+        description=(
+            "Capture the current Windows desktop as an MCP image with virtual-screen and cursor metadata. "
+            "Requires explicit Computer Use enablement and trusted/dangerous permission mode."
+        ),
+        read_only=True,
+        content_builder=_image_content,
+        gated_by="enable_computer_use",
+    ),
+    "computer_mouse": ToolSpec(
+        title="Computer mouse",
+        description=(
+            "Move, click, scroll, or drag the Windows mouse on the interactive desktop. "
+            "The Windows UAC secure desktop is intentionally not controllable."
+        ),
+        destructive=True,
+        gated_by="enable_computer_use",
+    ),
+    "computer_keyboard": ToolSpec(
+        title="Computer keyboard",
+        description=(
+            "Type text, press a key, or send a hotkey to the current Windows desktop. "
+            "Typed text is not echoed in tool output and UAC secure-desktop input is intentionally unsupported."
+        ),
+        destructive=True,
+        gated_by="enable_computer_use",
+    ),
+    "computer_launch": ToolSpec(
+        title="Launch desktop app",
+        description=(
+            "Open a workspace-local file or executable using normal Windows shell/double-click semantics. "
+            "Does not request, approve, or bypass UAC elevation."
+        ),
+        destructive=True,
+        open_world=True,
+        gated_by="enable_computer_use",
     ),
 }
 
@@ -1106,9 +1305,12 @@ def process_group_popen_kwargs() -> dict[str, Any]:
     if hasattr(os, "setsid"):
         return {"start_new_session": True}
     if os.name == "nt":
-        creation_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        kwargs = hidden_process_popen_kwargs()
+        creation_flag = int(kwargs.get("creationflags", 0))
+        creation_flag |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         if creation_flag:
-            return {"creationflags": creation_flag}
+            kwargs["creationflags"] = creation_flag
+        return kwargs
     return {}
 
 
@@ -1312,6 +1514,7 @@ class Workspace:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 timeout=2,
+                **hidden_process_popen_kwargs(),
             )
         except (OSError, subprocess.SubprocessError):
             return set()
@@ -1367,9 +1570,11 @@ class WorkspaceCommandManager:
                 return
             self.closed = True
             commands = list(self.commands.values())
+            commands.extend(self.output_commands.values())
             self.commands.clear()
             self.output_commands.clear()
         for command in commands:
+            command.close_stdin()
             command.refresh_status()
             if command.process.poll() is None:
                 terminate_process_group(command.process, signal.SIGTERM)
@@ -1387,6 +1592,7 @@ class Runtime:
         read_roots: list[Path] | tuple[Path, ...] = (),
         outside_read_policy: str = "deny",
         enable_view_image: bool = True,
+        enable_computer_use: bool = False,
         permission_mode: str = "safe",
         shell_env_policy: ShellEnvPolicy | None = None,
         allow_network: bool = False,
@@ -1403,12 +1609,22 @@ class Runtime:
             outside_read_policy=outside_read_policy,
         )
         self.enable_view_image = enable_view_image
+        self.enable_computer_use = enable_computer_use
         self._exposed_tool_names = [
             name
             for name, spec in TOOL_REGISTRY.items()
             if spec.gated_by is None or getattr(self, spec.gated_by)
         ]
         self._exposed_tool_name_set = frozenset(self._exposed_tool_names)
+        self.catalog_version = hashlib.sha256(
+            json.dumps(
+                [tool_definition(name, fake_readonly=False) for name in self._exposed_tool_names],
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+        self.started_at = datetime.now(timezone.utc).isoformat()
         if permission_mode not in PERMISSION_MODE_CHOICES:
             raise ToolFailure(
                 "INVALID_ARGUMENT",
@@ -1790,6 +2006,10 @@ class Runtime:
             "server": SERVER_NAME,
             "title": SERVER_TITLE,
             "version": __version__,
+            "server_instance_id": self.server_instance_id,
+            "started_at": self.started_at,
+            "pid": os.getpid(),
+            "catalog_version": self.catalog_version,
             "supported_protocol_versions": list(KNOWN_PROTOCOL_VERSIONS),
             **self._exec_environment_summary(),
             "auth_enabled": self.auth_enabled(),
@@ -1801,6 +2021,13 @@ class Runtime:
                 "inline_script": self.inline_script_policy(),
                 "global_tmp_write": self.global_tmp_write_policy(),
                 "secret_env_filter": self.secret_env_filter_policy(),
+                "computer_control": "allowed" if self.capabilities.computer_control else "blocked",
+            },
+            "computer_use": {
+                "enabled": self.enable_computer_use,
+                "platform": os.name,
+                "secure_desktop_control": False,
+                "uac_elevation": "not_supported",
             },
             "shell_env_inherit": self.shell_env_policy.inherit,
             "shell_env_include_only": list(self.shell_env_policy.include_only),
@@ -1983,6 +2210,10 @@ class Runtime:
         )
         if os.environ.get(f"{ENV_PREFIX}_TRACE") != "1":
             return
+        trace_args = args
+        if name == "computer_keyboard" and "text" in args:
+            trace_args = dict(args)
+            trace_args["text"] = f"<redacted:{len(str(args.get('text', '')))} chars>"
         event = {
             "event": "tool_call",
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
@@ -1993,7 +2224,7 @@ class Runtime:
             "duration_ms": duration_ms,
             "command_id": payload.get("command_id"),
             "truncated": payload.get("truncated"),
-            "args": redact_for_trace(args),
+            "args": redact_for_trace(trace_args),
         }
         print(json.dumps(event, sort_keys=True, separators=(",", ":")), file=sys.stderr, flush=True)
 
@@ -2268,6 +2499,7 @@ class Runtime:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     timeout=10,
+                    **hidden_process_popen_kwargs(),
                 )
             except Exception:
                 return None
@@ -2458,6 +2690,7 @@ class Runtime:
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
+                **hidden_process_popen_kwargs(),
             )
         except OSError:
             return None
@@ -2681,6 +2914,7 @@ class Runtime:
         yield_ms = self._bounded_sync_wait_ms(requested_yield_ms)
         max_output_bytes = int(args.get("max_output_bytes", 65536))
         tty = bool(args.get("tty", False))
+        interactive = bool(args.get("interactive", False))
         stdin_text = str(args.get("stdin", ""))
         env = self._command_env(args.get("env", {}))
         start = time.time()
@@ -2777,7 +3011,7 @@ class Runtime:
             if process.poll() is None:
                 raise
         finally:
-            if not tty:
+            if not tty and not interactive:
                 command.close_stdin()
         initial_wait = max(0, min(yield_ms, 30000)) / 1000.0
 
@@ -2834,7 +3068,7 @@ class Runtime:
                     details={"permission": INLINE_SCRIPT_PERMISSION, **inline_script},
                 )
         compact = " ".join(cmd.split()).lower()
-        if not self.capabilities.shell_expansion and SHELL_EXPANSION_RE.search(cmd):
+        if not self.capabilities.shell_expansion and command_uses_shell_expansion(cmd):
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
                 "Shell command substitution and parameter expansion require explicit permission.",
@@ -2994,6 +3228,7 @@ class Runtime:
             stderr=subprocess.PIPE,
             timeout=timeout,
             env=self._git_env() if env is None else env,
+            **hidden_process_popen_kwargs(),
         )
 
     def _run_git_bytes(
@@ -3006,6 +3241,7 @@ class Runtime:
             stderr=subprocess.PIPE,
             timeout=timeout,
             env=self._git_env() if env is None else env,
+            **hidden_process_popen_kwargs(),
         )
 
     def _git_status_not_repo(self, completed: subprocess.CompletedProcess[str]) -> dict[str, Any]:
@@ -3053,7 +3289,7 @@ class Runtime:
         pty_master_fd: int | None = None,
     ) -> CommandRun:
         return CommandRun(
-            command_id=secrets.token_urlsafe(18),
+            command_id=f"{self.server_instance_id}.{secrets.token_urlsafe(18)}",
             process=process,
             timeout_at=timeout_at,
             warnings=warnings or [],
@@ -3086,6 +3322,7 @@ class Runtime:
         command.refresh_status()
         if command.process.poll() is None:
             return
+        command.close_stdin()
         with self.commands_lock:
             self.commands.pop(command.command_id, None)
         self._remember_output_command(command)
@@ -3113,6 +3350,7 @@ class Runtime:
         with self.commands_lock:
             command = self.commands.get(command_id) or self.output_commands.get(command_id)
         if command is None:
+            self._raise_if_stale_command_id(command_id)
             raise ToolFailure(
                 "COMMAND_NOT_FOUND",
                 "Output command not found.",
@@ -3120,6 +3358,23 @@ class Runtime:
                 details={"retry_hint": _COMMAND_RECOVERY_HINT},
             )
         return command
+
+    def _raise_if_stale_command_id(self, command_id: str) -> None:
+        command_instance_id, separator, _ = command_id.partition(".")
+        if separator and command_instance_id != self.server_instance_id:
+            raise ToolFailure(
+                "BACKEND_RESTARTED",
+                "The command belongs to an earlier MCP backend instance.",
+                category="runtime",
+                details={
+                    "current_server_instance_id": self.server_instance_id,
+                    "command_server_instance_id": command_instance_id,
+                    "retry_hint": (
+                        "The old process state was released when the backend restarted. "
+                        "Start the work again with exec_command and use its new command_id."
+                    ),
+                },
+            )
 
     def _format_command_output(self, command: CommandRun, payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
         terminal = payload.get("status") != "running"
@@ -3229,7 +3484,7 @@ class Runtime:
         return compact
 
     def _command_output_summary(self, command: CommandRun, payload: dict[str, Any]) -> str:
-        retained = command.retained_output_bytes().decode("utf-8", errors="replace")
+        retained = decode_output_bytes(command.retained_output_bytes())
         lines = retained.splitlines()
         tail = next((line.strip() for line in reversed(lines) if line.strip()), "")
         if len(tail) > 120:
@@ -3297,7 +3552,7 @@ class Runtime:
             "offset": offset,
             "requested_offset": requested_offset,
             "limit": limit,
-            "content": chunk.decode("utf-8", errors="replace"),
+            "content": decode_output_bytes(chunk),
             "next_offset": next_offset,
             "total_retained_bytes": len(tail) + min(head_len, tail_start_offset),
             "head_retained_bytes": head_len,
@@ -3410,6 +3665,7 @@ class Runtime:
         with self.commands_lock:
             command = self.commands.get(command_id) or self.output_commands.get(command_id)
         if command is None:
+            self._raise_if_stale_command_id(command_id)
             raise ToolFailure(
                 "COMMAND_NOT_FOUND",
                 "Command not found; stdin access denied.",
@@ -3824,6 +4080,172 @@ class Runtime:
         }
         return payload
 
+    def _require_computer_control(self) -> None:
+        if not self.capabilities.computer_control:
+            raise ToolFailure(
+                "PERMISSION_REQUIRED",
+                "Computer Use requires trusted or dangerous permission mode.",
+                category="permission",
+                details={"permission": "computer_control", "permission_mode": self.permission_mode},
+            )
+        if os.name != "nt":
+            raise ToolFailure(
+                "UNSUPPORTED_PLATFORM",
+                "Computer Use currently supports Windows only.",
+                category="validation",
+                details={"platform": os.name},
+            )
+
+    def computer_screenshot(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_computer_control()
+        try:
+            data, metadata = computer_tools.capture_screen_png(
+                all_screens=bool(args.get("all_screens", True)),
+                max_width=int(args.get("max_width", 2000)),
+                max_height=int(args.get("max_height", 2000)),
+                max_bytes=int(args.get("max_bytes", 5_242_880)),
+            )
+        except computer_tools.ComputerUnavailable as exc:
+            raise ToolFailure(
+                "COMPUTER_UNAVAILABLE",
+                str(exc),
+                category="environment",
+                retryable=True,
+            ) from exc
+        return {
+            "mime_type": "image/png",
+            "bytes": len(data),
+            **metadata,
+            "_mcp_image_data": base64.b64encode(data).decode("ascii"),
+        }
+
+    def computer_mouse(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_computer_control()
+        action = str(args.get("action", ""))
+        x = int(args["x"]) if args.get("x") is not None else None
+        y = int(args["y"]) if args.get("y") is not None else None
+        try:
+            if action == "move":
+                if x is None or y is None:
+                    raise ValueError("move requires x and y")
+                computer_tools.move_cursor(x, y)
+            elif action == "click":
+                computer_tools.click_mouse(
+                    x=x,
+                    y=y,
+                    button=str(args.get("button", "left")),
+                    clicks=int(args.get("clicks", 1)),
+                    interval_ms=int(args.get("interval_ms", 100)),
+                )
+            elif action == "scroll":
+                computer_tools.scroll_mouse(
+                    delta=int(args.get("delta", 0)),
+                    x=x,
+                    y=y,
+                )
+            elif action == "drag":
+                if x is None or y is None or args.get("to_x") is None or args.get("to_y") is None:
+                    raise ValueError("drag requires x, y, to_x, and to_y")
+                computer_tools.drag_mouse(
+                    x=x,
+                    y=y,
+                    to_x=int(args["to_x"]),
+                    to_y=int(args["to_y"]),
+                    button=str(args.get("button", "left")),
+                    duration_ms=int(args.get("duration_ms", 300)),
+                )
+            else:
+                raise ValueError(f"Unsupported mouse action: {action}")
+            cursor_x, cursor_y = computer_tools.cursor_position()
+        except ValueError as exc:
+            raise ToolFailure("INVALID_ARGUMENT", str(exc), category="validation") from exc
+        except (OSError, computer_tools.ComputerUnavailable) as exc:
+            raise ToolFailure(
+                "COMPUTER_UNAVAILABLE",
+                str(exc),
+                category="environment",
+                retryable=True,
+            ) from exc
+        return {
+            "action": action,
+            "cursor_x": cursor_x,
+            "cursor_y": cursor_y,
+        }
+
+    def computer_keyboard(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_computer_control()
+        action = str(args.get("action", ""))
+        try:
+            if action == "type":
+                if "text" not in args:
+                    raise ValueError("type requires text")
+                text = str(args.get("text", ""))
+                computer_tools.type_text(text, delay_ms=int(args.get("delay_ms", 0)))
+                return {"action": action, "characters_typed": len(text)}
+            if action == "key":
+                key = str(args.get("key", ""))
+                if not key:
+                    raise ValueError("key requires key")
+                computer_tools.press_key(key)
+                return {"action": action, "key": key.lower()}
+            if action == "hotkey":
+                keys = [str(item) for item in args.get("keys", [])]
+                if not keys:
+                    raise ValueError("hotkey requires keys")
+                normalized = {item.strip().lower() for item in keys}
+                if {"ctrl", "alt"}.issubset(normalized) and {"delete", "del"} & normalized:
+                    raise ValueError("Ctrl+Alt+Delete is a secure-attention sequence and cannot be automated")
+                computer_tools.hotkey(keys)
+                return {"action": action, "keys": [item.lower() for item in keys]}
+            raise ValueError(f"Unsupported keyboard action: {action}")
+        except ValueError as exc:
+            raise ToolFailure("INVALID_ARGUMENT", str(exc), category="validation") from exc
+        except (OSError, computer_tools.ComputerUnavailable) as exc:
+            raise ToolFailure(
+                "COMPUTER_UNAVAILABLE",
+                str(exc),
+                category="environment",
+                retryable=True,
+            ) from exc
+
+    def computer_launch(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_computer_control()
+        target = self.workspace.resolve_existing(str(args.get("path", "")))
+        workdir = self.workspace.resolve_existing(str(args.get("workdir", ".")))
+        if not target.path.is_file():
+            raise ToolFailure("INVALID_ARGUMENT", "path must resolve to a file.", category="validation")
+        if not workdir.path.is_dir():
+            raise ToolFailure("INVALID_ARGUMENT", "workdir must resolve to a directory.", category="validation")
+        arguments = [str(item) for item in args.get("arguments", [])]
+        try:
+            result = computer_tools.launch_gui(
+                target.path,
+                arguments=arguments,
+                cwd=workdir.path,
+                show=str(args.get("show", "normal")),
+            )
+        except ValueError as exc:
+            raise ToolFailure("INVALID_ARGUMENT", str(exc), category="validation") from exc
+        except computer_tools.ComputerUnavailable as exc:
+            message = str(exc)
+            code = "ELEVATION_REQUIRED" if "elevation" in message.lower() else "COMPUTER_UNAVAILABLE"
+            raise ToolFailure(
+                code,
+                message,
+                category="permission" if code == "ELEVATION_REQUIRED" else "environment",
+                retryable=False if code == "ELEVATION_REQUIRED" else True,
+                details={"secure_desktop_control": False} if code == "ELEVATION_REQUIRED" else None,
+            ) from exc
+        wait_ms = int(args.get("wait_ms", 750))
+        if wait_ms:
+            time.sleep(wait_ms / 1000.0)
+        return {
+            **result,
+            "path": target.display,
+            "workdir": workdir.display,
+            "wait_ms": wait_ms,
+        }
+
 
 def path_resolves_within(path: Path, root: Path) -> bool:
     try:
@@ -3870,10 +4292,26 @@ def find_literal(line: str, needle: str, case_sensitive: bool) -> int:
     return haystack.find(needle)
 
 
-def shlex_split(command: str) -> list[str]:
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+def shlex_split(command: str, *, platform: str | None = None) -> list[str]:
+    windows = (os.name if platform is None else platform) == "nt"
+    lexer = shlex.shlex(command, posix=not windows, punctuation_chars=True)
     lexer.whitespace_split = True
-    return list(lexer)
+    tokens = list(lexer)
+    if not windows:
+        return tokens
+    return [
+        token[1:-1]
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}
+        else token
+        for token in tokens
+    ]
+
+
+def command_uses_shell_expansion(command: str, *, platform: str | None = None) -> bool:
+    if SHELL_EXPANSION_RE.search(command):
+        return True
+    windows = (os.name if platform is None else platform) == "nt"
+    return windows and WINDOWS_SHELL_EXPANSION_RE.search(command) is not None
 
 
 def parse_heredoc_delimiter(command: str, start: int) -> tuple[int, str, bool]:
@@ -4120,10 +4558,28 @@ def inline_script_command(command: str) -> dict[str, str] | None:
 def inline_script_segment(command: str | None, args: list[str]) -> dict[str, str] | None:
     if not command:
         return None
-    name = PurePosixPath(command.replace("\\", "/")).name.lower()
+    normalized_command = command.lstrip("@").replace("\\", "/")
+    name = PurePosixPath(normalized_command).name.lower()
+    embedded_windows_options = ""
+    windows_command_match = WINDOWS_COMMAND_TOKEN_RE.search(normalized_command)
+    if windows_command_match is not None:
+        name = windows_command_match.group("name").lower()
+        embedded_windows_options = windows_command_match.group("options").lower()
     if name == "env":
         _candidates, wrapped_command, wrapped_args = env_wrapped_command(args)
         return inline_script_segment(wrapped_command, wrapped_args)
+    if name in WINDOWS_SCRIPT_HOSTS:
+        return {"command": name, "option": "windows-script-host"}
+    if os.name == "nt" and name in WINDOWS_COMMAND_WRAPPERS:
+        return {"command": name, "option": "windows-command-wrapper"}
+    if name in WINDOWS_COMMAND_SHELLS:
+        if os.name == "nt":
+            return {"command": name, "option": embedded_windows_options or "windows-command-shell"}
+        for arg in ([embedded_windows_options] if embedded_windows_options else []) + args:
+            option = arg.lower()
+            if option.startswith("/") and re.search(r"(?:^|/)[ck]", option):
+                return {"command": name, "option": option}
+        return None
     if name in {"bash", "sh", "zsh"}:
         for arg in args:
             if arg.startswith("-") and "c" in arg.lstrip("-"):
@@ -5023,6 +5479,11 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "preview_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},
                 "stdin": {**string, "default": ""},
                 "tty": {**boolean, "default": False},
+                "interactive": {
+                    **boolean,
+                    "default": False,
+                    "description": "Keep pipe-backed stdin open for later write_stdin calls; useful where tty is unavailable.",
+                },
                 "env": {"type": "object", "additionalProperties": {"type": "string"}, "default": {}},
             },
             ["cmd"],
@@ -5116,6 +5577,10 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                         "list_files",
                         "search_text",
                         "view_image",
+                        "computer_screenshot",
+                        "computer_mouse",
+                        "computer_keyboard",
+                        "computer_launch",
                     ],
                 },
                 "permission": {
@@ -5130,6 +5595,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                         "privileged_executable",
                         "write_generated_or_ignored",
                         "filesystem_read",
+                        "computer_control",
                     ],
                 },
                 "reason": {**string, "minLength": 1},
@@ -5146,6 +5612,54 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "max_width": {**integer, "minimum": 1, "maximum": 10000, "default": IMAGE_RESIZE_MAX_DIMENSION},
                 "max_height": {**integer, "minimum": 1, "maximum": 10000, "default": IMAGE_RESIZE_MAX_DIMENSION},
                 "auto_resize": {**boolean, "default": True},
+            },
+            ["path"],
+        ),
+        "computer_screenshot": object_schema(
+            {
+                "all_screens": {**boolean, "default": True},
+                "max_bytes": {**integer, "minimum": 1024, "maximum": 10485760, "default": 5242880},
+                "max_width": {**integer, "minimum": 320, "maximum": 10000, "default": 2000},
+                "max_height": {**integer, "minimum": 200, "maximum": 10000, "default": 2000},
+            }
+        ),
+        "computer_mouse": object_schema(
+            {
+                "action": {**string, "enum": ["move", "click", "scroll", "drag"]},
+                "x": {**integer, "minimum": -100000, "maximum": 100000},
+                "y": {**integer, "minimum": -100000, "maximum": 100000},
+                "to_x": {**integer, "minimum": -100000, "maximum": 100000},
+                "to_y": {**integer, "minimum": -100000, "maximum": 100000},
+                "button": {**string, "enum": ["left", "right", "middle"], "default": "left"},
+                "clicks": {**integer, "minimum": 1, "maximum": 3, "default": 1},
+                "interval_ms": {**integer, "minimum": 0, "maximum": 2000, "default": 100},
+                "delta": {**integer, "minimum": -100, "maximum": 100, "default": 0},
+                "duration_ms": {**integer, "minimum": 0, "maximum": 10000, "default": 300},
+            },
+            ["action"],
+        ),
+        "computer_keyboard": object_schema(
+            {
+                "action": {**string, "enum": ["type", "key", "hotkey"]},
+                "text": {**string, "maxLength": 10000},
+                "key": {**string, "minLength": 1, "maxLength": 32},
+                "keys": {
+                    "type": "array",
+                    "items": {**string, "minLength": 1, "maxLength": 32},
+                    "minItems": 1,
+                    "maxItems": 8,
+                },
+                "delay_ms": {**integer, "minimum": 0, "maximum": 1000, "default": 0},
+            },
+            ["action"],
+        ),
+        "computer_launch": object_schema(
+            {
+                "path": {**string, "minLength": 1},
+                "arguments": {"type": "array", "items": {"type": "string"}, "maxItems": 64},
+                "workdir": {**string, "default": "."},
+                "show": {**string, "enum": ["hidden", "normal", "minimized", "maximized"], "default": "normal"},
+                "wait_ms": {**integer, "minimum": 0, "maximum": 10000, "default": 750},
             },
             ["path"],
         ),
@@ -5182,6 +5696,9 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
             "name": SERVER_NAME,
             "title": SERVER_TITLE,
             "version": __version__,
+            "instanceId": runtime.server_instance_id,
+            "startedAt": runtime.started_at,
+            "pid": os.getpid(),
         },
         "transport": {
             "type": "streamable_http",
@@ -5192,12 +5709,20 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
         "tools": {
             "count": len(names),
             "names": names,
+            "catalogVersion": runtime.catalog_version,
             "readOnlyHintTrue": read_only,
             "readOnlyHintFalse": mutating,
             "annotationOverride": ("fake_readonly" if runtime.fake_readonly_annotations else None),
         },
         "capabilities": {
             "tools": {"listChanged": False},
+        },
+        "runtime": {
+            "state": "ready",
+            "workspace": str(runtime.workspace.root),
+            "serverInstanceId": runtime.server_instance_id,
+            "startedAt": runtime.started_at,
+            "pid": os.getpid(),
         },
     }
     return payload
@@ -5285,6 +5810,8 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             MCP_ENDPOINT_PATH,
             "/.well-known/mcp.json",
             "/.well-known/mcp/server-card.json",
+            "/healthz",
+            "/readyz",
             "/.well-known/oauth-authorization-server",
             "/.well-known/oauth-protected-resource",
             "/oauth/authorize",
@@ -5305,6 +5832,31 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
     def handle_metadata_request(self, *, head_only: bool) -> None:
         request_path = self.path.split("?", 1)[0]
         normalized = posixpath.normpath(request_path)
+        if normalized == "/healthz":
+            self.send_json(
+                {
+                    "ok": True,
+                    "state": "live",
+                    "server_instance_id": self.runtime.server_instance_id,
+                    "pid": os.getpid(),
+                },
+                head_only=head_only,
+            )
+            return
+        if normalized == "/readyz":
+            self.send_json(
+                {
+                    "ok": True,
+                    "state": "ready",
+                    "server_instance_id": self.runtime.server_instance_id,
+                    "workspace": str(self.runtime.workspace.root),
+                    "catalog_version": self.runtime.catalog_version,
+                    "tool_count": len(self.runtime.exposed_tool_names()),
+                    "pid": os.getpid(),
+                },
+                head_only=head_only,
+            )
+            return
         if normalized == "/.well-known/oauth-authorization-server":
             self.handle_oauth_as_metadata(head_only=head_only)
             return
@@ -5895,8 +6447,8 @@ class RuntimeHTTPServer(http.server.ThreadingHTTPServer):
         handler: type[MCPHandler],
         runtime: Runtime,
     ) -> None:
-        super().__init__(address, handler)
         self.runtime = runtime
+        super().__init__(address, handler)
 
     def server_close(self) -> None:
         self.runtime.close()
@@ -5920,6 +6472,7 @@ def build_runtime(
         read_roots=read_roots_from_args(args),
         outside_read_policy=runtime_policy.outside_read_policy,
         enable_view_image=args.enable_view_image,
+        enable_computer_use=args.enable_computer_use,
         permission_mode=runtime_policy.permission_mode,
         shell_env_policy=runtime_policy.shell_env_policy,
         allow_network=runtime_policy.allow_network,
@@ -6055,24 +6608,88 @@ def run_http(args: argparse.Namespace) -> int:
         )
         return 2
 
-    runtime = build_runtime(args, runtime_policy, auth_token=auth_token, oauth_config=oauth_config, transport="http")
-    server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime)
-    if oauth_config:
-        url_label = oauth_config.server_url or "dynamic request URL"
-        suffix = " + bearer" if runtime.auth_token else ""
-        auth_label = f"oauth2{suffix} enabled (server_url={url_label})"
-    elif runtime.auth_token:
-        auth_label = "bearer auth enabled"
-    else:
-        auth_label = "no auth configured"
-    base_url = _http_base_for_bind_host(str(args.host), args.port)
-    print(f"{SERVER_NAME} listening on {base_url}/mcp ({auth_label})", file=sys.stderr)
+    workspace = Path(args.workspace or os.environ.get(f"{ENV_PREFIX}_WORKSPACE") or os.getcwd())
+    lease = HTTPInstanceLease(str(args.host), int(args.port), workspace)
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        return 130
+        lease.acquire()
+    except HTTPInstanceConflict as exc:
+        owner = {
+            key: exc.owner.get(key)
+            for key in ("state", "generation", "pid", "host", "port", "workspace", "server_instance_id")
+            if exc.owner.get(key) is not None
+        }
+        print(
+            json.dumps(
+                {
+                    "event": "server_startup_failed",
+                    "category": "instance_conflict",
+                    "phase": "acquire_lock",
+                    "retryable": False,
+                    "endpoint": f"{args.host}:{args.port}",
+                    "owner": owner,
+                    "recovery_hint": "Inspect the recorded owner; do not kill an unverified PID.",
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 98
+
+    runtime: Runtime | None = None
+    server: RuntimeHTTPServer | None = None
+    try:
+        runtime = build_runtime(
+            args,
+            runtime_policy,
+            auth_token=auth_token,
+            oauth_config=oauth_config,
+            transport="http",
+        )
+        try:
+            server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime)
+        except OSError:
+            runtime.close()
+            runtime = None
+            print(
+                json.dumps(
+                    {
+                        "event": "server_startup_failed",
+                        "category": "port_in_use",
+                        "phase": "bind",
+                        "retryable": False,
+                        "endpoint": f"{args.host}:{args.port}",
+                        "workspace": str(workspace.expanduser().resolve(strict=True)),
+                        "cause_type": "OSError",
+                        "recovery_hint": "Inspect the port owner and workspace identity; do not kill an unverified PID.",
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            return 98
+        lease.mark_ready(runtime)
+        if oauth_config:
+            url_label = oauth_config.server_url or "dynamic request URL"
+            suffix = " + bearer" if runtime.auth_token else ""
+            auth_label = f"oauth2{suffix} enabled (server_url={url_label})"
+        elif runtime.auth_token:
+            auth_label = "bearer auth enabled"
+        else:
+            auth_label = "no auth configured"
+        base_url = _http_base_for_bind_host(str(args.host), args.port)
+        print(f"{SERVER_NAME} listening on {base_url}/mcp ({auth_label})", file=sys.stderr)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            return 130
     finally:
-        server.server_close()
+        if server is not None:
+            server.server_close()
+        elif runtime is not None:
+            runtime.close()
+        lease.release()
     return 0
 
 
@@ -6166,6 +6783,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=os.environ.get("CODING_TOOLS_MCP_ENABLE_VIEW_IMAGE", "1") != "0",
         help="enable the P1 view_image tool",
+    )
+    parser.add_argument(
+        "--enable-computer-use",
+        action="store_true",
+        default=truthy_env(os.environ.get(f"{ENV_PREFIX}_ENABLE_COMPUTER_USE")),
+        help=(
+            "enable Windows desktop screenshot/mouse/keyboard/launch tools; "
+            "trusted or dangerous permission mode is still required; UAC secure-desktop control is never enabled"
+        ),
     )
     parser.add_argument(
         "--dangerously-skip-all-permissions",

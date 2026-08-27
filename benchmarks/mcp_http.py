@@ -49,13 +49,23 @@ def connect_with_retry(
     """
     deadline = time.monotonic() + timeout_seconds
     last_error: BaseException | None = None
-    while time.monotonic() <= deadline:
-        client = McpHttpClient(endpoint, timeout=request_timeout)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        client = McpHttpClient(endpoint, timeout=min(request_timeout, remaining))
         try:
-            return client, client.initialize(), None
+            initialized = client.initialize()
+            # Startup has its own deadline, but normal benchmark calls retain
+            # the independently configured per-request timeout.
+            client.timeout = request_timeout
+            return client, initialized, None
         except catch as exc:
             last_error = exc
-            time.sleep(poll_interval)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(poll_interval, remaining))
     return None, None, str(last_error) if last_error is not None else "startup timeout elapsed"
 
 
@@ -162,6 +172,10 @@ class McpHttpClient:
             ) from exc
         except urllib.error.URLError as exc:
             raise McpHttpError(f"Could not connect to MCP endpoint: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise McpHttpError(f"MCP request timed out after {self.timeout:g} seconds") from exc
+        except OSError as exc:
+            raise McpHttpError(f"MCP transport failed: {exc}") from exc
 
         if not expect_reply and status in (200, 202, 204):
             return JsonRpcReply(status=status, payload=None, headers=response_headers)

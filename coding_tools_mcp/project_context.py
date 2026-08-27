@@ -5,6 +5,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .processes import hidden_process_popen_kwargs
+
 
 CONTEXT_FILE_NAMES = frozenset({"AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"})
 SKIPPED_CONTEXT_DIRS = frozenset(
@@ -154,6 +156,7 @@ def _git_context_files(root: Path) -> list[str] | None:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=5,
+            **hidden_process_popen_kwargs(),
         )
     except (OSError, subprocess.SubprocessError):
         return None

@@ -18,6 +18,35 @@ SPEC.loader.exec_module(watchdog)
 
 
 class SecureTunnelWatchdogTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.backend_probe = patch.object(
+            watchdog,
+            "probe_mcp_backend",
+            return_value=watchdog.BackendProbe(
+                True,
+                "ready",
+                "server_info",
+                False,
+                "http://127.0.0.1:18765/mcp",
+                "MCP backend is ready",
+                workspace="D:/coding-tools-mcp",
+                tool_count=22,
+            ),
+        )
+        self.backend_probe.start()
+        self.addCleanup(self.backend_probe.stop)
+
+    def test_backend_gate_stops_a_published_tunnel_when_mcp_is_unavailable(self) -> None:
+        decision = watchdog.decide_backend_action("Running", backend_ok=False)
+        self.assertEqual(decision, "stop_backend_unavailable")
+
+    def test_backend_gate_holds_a_stopped_tunnel_until_mcp_is_ready(self) -> None:
+        decision = watchdog.decide_backend_action("Ready", backend_ok=False)
+        self.assertEqual(decision, "hold_backend_unavailable")
+
+    def test_backend_gate_allows_normal_tunnel_health_when_mcp_is_ready(self) -> None:
+        self.assertEqual(watchdog.decide_backend_action("Running", backend_ok=True), "proceed")
+
     def test_ready_task_is_started_even_after_zero_exit(self) -> None:
         decision = watchdog.decide_action("Ready", None, 0, 2)
         self.assertEqual(decision.action, "start")
@@ -330,6 +359,9 @@ class SecureTunnelWatchdogTests(unittest.TestCase):
             failure_threshold=2,
             startup_grace_seconds=0,
             health_timeout_seconds=1,
+            backend_url="http://127.0.0.1:18765/mcp",
+            backend_workspace="D:/coding-tools-mcp",
+            backend_required_tools=("server_info", "computer_screenshot"),
         )
 
 

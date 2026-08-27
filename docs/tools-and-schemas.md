@@ -6,7 +6,7 @@ properties, annotations, and error codes with the contract.
 
 ## Fixed inventory
 
-The default catalog contains exactly 18 tools:
+The complete catalog contains exactly 22 tools:
 
 - `server_info`: server, workspace, automatic project context, policy, runtime,
   auth, protocol, and fixed-catalog metadata.
@@ -28,10 +28,16 @@ The default catalog contains exactly 18 tools:
 - `git_blame`: structured bounded line attribution.
 - `request_permissions`: report elicitation status without silently granting.
 - `view_image`: one MCP image content block plus structured metadata.
+- `computer_screenshot`: capture the current interactive desktop as an image.
+- `computer_mouse`: perform bounded move, click, drag, and scroll actions.
+- `computer_keyboard`: type text or send a bounded key combination.
+- `computer_launch`: launch one GUI application through the Windows shell.
 
 `view_image` may be disabled when an installation cannot accept binary image
-content. That capability gate is not a tool profile. The other 17 tools are
-always advertised, and `listChanged` is `false`.
+content. The four `computer_*` tools are exposed only when Computer Use is
+enabled and the permission mode allows desktop control. Those capability gates
+are not tool profiles: the 17 core tools are always advertised, and the server's
+catalog version identifies the exact exposed schema for connector refreshes.
 
 ## Result envelope
 

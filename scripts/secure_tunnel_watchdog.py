@@ -20,6 +20,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    from .mcp_backend_probe import BackendProbe, probe_mcp_backend
+except ImportError:  # direct script execution
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from mcp_backend_probe import BackendProbe, probe_mcp_backend
+
 
 RUNNING = "Running"
 READY = "Ready"
@@ -50,6 +56,9 @@ class Config:
     failure_threshold: int
     startup_grace_seconds: float
     health_timeout_seconds: float
+    backend_url: str
+    backend_workspace: str
+    backend_required_tools: tuple[str, ...]
     main_task_path: str = "\\"
     tunnel_log: Path | None = None
     recovery_backoff_seconds: tuple[float, ...] = DEFAULT_RECOVERY_BACKOFF_SECONDS
@@ -71,6 +80,14 @@ class HealthProbe:
     local_live: bool
     ready: bool
     control_plane_poll: bool
+
+
+def decide_backend_action(task_state: str, backend_ok: bool) -> str:
+    if backend_ok:
+        return "proceed"
+    if task_state == RUNNING:
+        return "stop_backend_unavailable"
+    return "hold_backend_unavailable"
 
 
 def decide_action(
@@ -299,6 +316,15 @@ def restart_task(config: Config) -> None:
         raise RuntimeError("could not restart the primary tunnel task")
 
 
+def stop_task(config: Config) -> None:
+    result = run_powershell(
+        config,
+        "Stop-ScheduledTask -TaskPath $env:OPENAI_TUNNEL_TASK_PATH -TaskName $env:OPENAI_TUNNEL_TASK_NAME",
+    )
+    if result.returncode != 0:
+        raise RuntimeError("could not stop the primary tunnel task")
+
+
 def current_pid(path: Path) -> int | None:
     try:
         value = int(path.read_text(encoding="utf-8").strip())
@@ -462,6 +488,39 @@ def run_once(config: Config) -> int:
     healthy_since_at = float(state.get("healthy_since_at", 0.0))
     last_deadline_time = str(state.get("last_deadline_time", "") or "")
     status = task_status(config)
+    backend = probe_mcp_backend(
+        config.backend_url,
+        expected_workspace=config.backend_workspace,
+        required_tools=config.backend_required_tools,
+        timeout=config.health_timeout_seconds,
+    )
+    backend_action = decide_backend_action(status.state, backend.ok)
+    if backend_action != "proceed":
+        if backend_action == "stop_backend_unavailable":
+            stop_task(config)
+        append_event(
+            config.event_log,
+            max_bytes=config.event_log_max_bytes,
+            backups=config.event_log_backups,
+            action=backend_action,
+            task_state=status.state,
+            backend_ok=backend.ok,
+            backend_category=backend.category,
+            backend_phase=backend.phase,
+            backend_retryable=backend.retryable,
+            backend_message=backend.message,
+            backend_state=backend.backend_state,
+            backend_cause_type=backend.cause_type,
+            backend_cause_message=backend.cause_message,
+            backend_recovery_hint=backend.recovery_hint,
+        )
+        save_state(
+            config.state_file,
+            consecutive_failures=0,
+            last_action=backend_action,
+            last_deadline_time=last_deadline_time,
+        )
+        return 1
     probe = probe_health(config) if status.state == RUNNING else None
     new_deadline_drops = 0
     if status.state == RUNNING:
@@ -638,6 +697,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--failure-threshold", type=int, default=2)
     parser.add_argument("--startup-grace-seconds", type=float, default=45.0)
     parser.add_argument("--health-timeout-seconds", type=float, default=10.0)
+    parser.add_argument("--backend-url", required=True)
+    parser.add_argument("--backend-workspace", required=True)
+    parser.add_argument("--backend-required-tool", action="append", default=[])
     parser.add_argument(
         "--recovery-backoff-seconds",
         type=parse_backoff,
@@ -662,6 +724,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
         failure_threshold=args.failure_threshold,
         startup_grace_seconds=max(0.0, args.startup_grace_seconds),
         health_timeout_seconds=max(0.1, args.health_timeout_seconds),
+        backend_url=args.backend_url,
+        backend_workspace=args.backend_workspace,
+        backend_required_tools=tuple(args.backend_required_tool),
         main_task_path=args.main_task_path,
         recovery_backoff_seconds=args.recovery_backoff_seconds,
         stable_health_seconds=max(0.0, args.stable_health_seconds),
