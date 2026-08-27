@@ -195,10 +195,23 @@ DESTRUCTIVE_RE = re.compile(
 )
 MAX_HTTP_REQUEST_BYTES = 1_048_576
 EXEC_PREVIEW_BYTES = 4096
+HTTP_SYNC_WAIT_CAP_MS = 3000
 MAX_ACTIVE_COMMANDS = 16
 MAX_RETAINED_OUTPUT_COMMANDS = 32
 COMPLETED_COMMAND_TTL_SECONDS = 300
 MAX_RUNTIME_OUTPUT_BYTES = 16 * 1024 * 1024
+MUTATION_RECEIPT_MAX_BYTES = 5 * 1024 * 1024
+MUTATING_TOOL_NAMES = frozenset(
+    {
+        "apply_patch",
+        "exec_command",
+        "write_stdin",
+        "kill_command",
+        "computer_mouse",
+        "computer_keyboard",
+        "computer_launch",
+    }
+)
 _COMMAND_RECOVERY_HINT = (
     "This command_id has expired or never existed; a finished command keeps its"
     f" output for {COMPLETED_COMMAND_TTL_SECONDS} seconds and only the last"
@@ -1404,6 +1417,7 @@ class Runtime:
                 details={"supported": list(PERMISSION_MODE_CHOICES)},
             )
         self.permission_mode = permission_mode
+        self.transport = transport
         self.capabilities = PERMISSION_MODE_CAPABILITIES[permission_mode]
         self.dangerously_skip_all_permissions = self.capabilities.skip_all_permissions
         # Faking annotations is only defensible where the caller has already
@@ -1445,6 +1459,7 @@ class Runtime:
         self.patch_baselines: dict[str, str | None] = {}
         self.patch_lock = threading.Lock()
         self.patch_committer = AtomicPatchCommitter()
+        self.mutation_receipt_lock = threading.Lock()
         # ProjectContext is frozen and derived only from the workspace tree, so
         # an embedder that builds several runtimes over one workspace can reuse
         # the discovery (git ls-files / directory walk) result.
@@ -1683,10 +1698,89 @@ class Runtime:
             "home": str(self.command_home_dir()),
             "tmpdir": str(self.command_tmp_dir()),
             "cache_dir": str(self.cache_dir),
+            "mutation_receipt_file": str(self._mutation_receipt_file()),
         }
+
+    def _mutation_receipt_file(self) -> Path:
+        """Durable local evidence for calls whose upstream response may be lost."""
+        return self.workspace.root / ".coding-tools-mcp" / "mutation-receipts.jsonl"
+
+    @staticmethod
+    def _mutation_args_hash(name: str, args: dict[str, Any]) -> str:
+        encoded = json.dumps(
+            {"tool": name, "arguments": args},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _append_mutation_receipt(
+        self,
+        *,
+        receipt_id: str,
+        phase: str,
+        tool: str,
+        args_hash: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Append a bounded receipt without ever making the tool itself fail."""
+        path = self._mutation_receipt_file()
+        event: dict[str, Any] = {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "receipt_id": receipt_id,
+            "phase": phase,
+            "tool": tool,
+            "args_sha256": args_hash,
+            "server_instance_id": self.server_instance_id,
+        }
+        if payload is not None:
+            error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+            affected = payload.get("affected_files")
+            event.update(
+                {
+                    "ok": bool(payload.get("ok")),
+                    "status": payload.get("status"),
+                    "error_code": error.get("code"),
+                    "command_id": payload.get("command_id"),
+                    "affected_files": [
+                        item.get("path")
+                        for item in affected
+                        if isinstance(item, dict) and isinstance(item.get("path"), str)
+                    ]
+                    if isinstance(affected, list)
+                    else None,
+                }
+            )
+        try:
+            with self.mutation_receipt_lock:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    if path.stat().st_size >= MUTATION_RECEIPT_MAX_BYTES:
+                        rotated = path.with_name(path.name + ".1")
+                        if rotated.exists():
+                            rotated.unlink()
+                        os.replace(path, rotated)
+                except FileNotFoundError:
+                    pass
+                with path.open("a", encoding="utf-8", newline="\n") as stream:
+                    stream.write(json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+        except OSError:
+            # Evidence must be best effort; a full/read-only disk cannot turn a
+            # valid user operation into an unrelated MCP failure.
+            return
 
     def _landlock_enforced(self, landlock: dict[str, Any]) -> bool:
         return bool(landlock.get("available")) and self.landlock_enabled()
+
+    def _bounded_sync_wait_ms(self, requested_ms: int) -> int:
+        requested = max(0, requested_ms)
+        if self.transport == "http":
+            return min(requested, HTTP_SYNC_WAIT_CAP_MS)
+        return requested
 
     def server_info_payload(self) -> dict[str, Any]:
         tools = self.exposed_tool_names()
@@ -1742,9 +1836,33 @@ class Runtime:
             raise JsonRpcError(-32602, f"Unknown tool: {name}", {"reason": "unknown_tool"})
         spec = TOOL_REGISTRY[name]
         validate_arguments(name, args)
+        receipt_id: str | None = None
+        receipt_hash: str | None = None
+        if name in MUTATING_TOOL_NAMES:
+            receipt_id = secrets.token_urlsafe(12)
+            receipt_hash = self._mutation_args_hash(name, args)
+            self._append_mutation_receipt(
+                receipt_id=receipt_id,
+                phase="started",
+                tool=name,
+                args_hash=receipt_hash,
+            )
         try:
             payload = handler(args)
             payload.setdefault("ok", True)
+            if receipt_id is not None and receipt_hash is not None:
+                payload["mutation_receipt"] = {
+                    "receipt_id": receipt_id,
+                    "args_sha256": receipt_hash,
+                    "path": str(self._mutation_receipt_file()),
+                }
+                self._append_mutation_receipt(
+                    receipt_id=receipt_id,
+                    phase="finished",
+                    tool=name,
+                    args_hash=receipt_hash,
+                    payload=payload,
+                )
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             content = spec.content_builder(payload) if spec.content_builder else None
             return make_tool_result(name, payload, is_error=payload.get("ok") is False, content=content)
@@ -1774,6 +1892,19 @@ class Runtime:
                 }
             if exc.code == "ELICITATION_UNSUPPORTED":
                 payload["status"] = "unsupported"
+            if receipt_id is not None and receipt_hash is not None:
+                payload["mutation_receipt"] = {
+                    "receipt_id": receipt_id,
+                    "args_sha256": receipt_hash,
+                    "path": str(self._mutation_receipt_file()),
+                }
+                self._append_mutation_receipt(
+                    receipt_id=receipt_id,
+                    phase="finished",
+                    tool=name,
+                    args_hash=receipt_hash,
+                    payload=payload,
+                )
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
         except Exception as exc:  # noqa: BLE001 - tool failures must stay structured
@@ -1789,6 +1920,19 @@ class Runtime:
             }
             if spec.error_status:
                 payload["status"] = spec.error_status
+            if receipt_id is not None and receipt_hash is not None:
+                payload["mutation_receipt"] = {
+                    "receipt_id": receipt_id,
+                    "args_sha256": receipt_hash,
+                    "path": str(self._mutation_receipt_file()),
+                }
+                self._append_mutation_receipt(
+                    receipt_id=receipt_id,
+                    phase="finished",
+                    tool=name,
+                    args_hash=receipt_hash,
+                    payload=payload,
+                )
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
 
@@ -2533,7 +2677,8 @@ class Runtime:
             raise ToolFailure("NOT_A_DIRECTORY", "workdir is not a directory.", category="validation")
         self._check_command_policy(cmd, args)
         timeout_ms = int(args.get("timeout_ms", 30000))
-        yield_ms = int(args.get("yield_time_ms", 10000))
+        requested_yield_ms = int(args.get("yield_time_ms", 10000))
+        yield_ms = self._bounded_sync_wait_ms(requested_yield_ms)
         max_output_bytes = int(args.get("max_output_bytes", 65536))
         tty = bool(args.get("tty", False))
         stdin_text = str(args.get("stdin", ""))
@@ -2588,10 +2733,17 @@ class Runtime:
                 tty=tty,
                 popen_kwargs=popen_extra,
             )
+            sync_wait_warning = None
+            if yield_ms < requested_yield_ms:
+                sync_wait_warning = (
+                    f"HTTP transport caps synchronous command waits at {HTTP_SYNC_WAIT_CAP_MS}ms; "
+                    "the process is still running and should be polled by command_id."
+                )
+            command_warnings = [warning for warning in (landlock_warning, sync_wait_warning) if warning]
             command = self._make_command(
                 process,
                 timeout_at=deadline,
-                warnings=[landlock_warning] if landlock_warning else None,
+                warnings=command_warnings or None,
                 pty_master_fd=pty_master_fd,
             )
             with self.commands_lock:
@@ -2979,7 +3131,7 @@ class Runtime:
                 "arguments": {
                     "command_id": command.command_id,
                     "chars": "",
-                    "yield_time_ms": 10000,
+                    "yield_time_ms": self._bounded_sync_wait_ms(10000),
                 },
             }
         output_refs = {
@@ -3178,7 +3330,9 @@ class Runtime:
             return self._format_command_output(command, payload, args)
         if chars:
             command.write_input(chars.encode("utf-8"))
-        wait_until = time.time() + (int(args.get("yield_time_ms", 10000)) / 1000.0)
+        requested_yield_ms = int(args.get("yield_time_ms", 10000))
+        yield_ms = self._bounded_sync_wait_ms(requested_yield_ms)
+        wait_until = time.time() + (yield_ms / 1000.0)
         first_output_at: float | None = None
         while time.time() < wait_until and command.process.poll() is None:
             time.sleep(0.02)
@@ -3192,6 +3346,12 @@ class Runtime:
                     if time.time() - first_output_at >= 0.05:
                         break
         payload = command.snapshot_since_cursor(int(args.get("max_output_bytes", 65536)))
+        if yield_ms < requested_yield_ms:
+            warnings = list(payload.get("warnings", []))
+            warnings.append(
+                f"HTTP transport caps synchronous polling waits at {HTTP_SYNC_WAIT_CAP_MS}ms; poll again if needed."
+            )
+            payload["warnings"] = warnings
         return self._format_command_output(command, payload, args)
 
     def _wait_for_command_exit(self, command: CommandRun, wait_seconds: float) -> bool:
