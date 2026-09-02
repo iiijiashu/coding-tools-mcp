@@ -66,7 +66,8 @@ def render_rehydrate(state: ProtectedTaskState, *, max_chars: int = 8_192) -> st
 
     Protected identity/acceptance/result/cleanup fields are atomic: if they do
     not fit, this function raises instead of silently truncating them.  Working
-    sections are appended only while room remains.
+    sections are appended only while room remains.  Every state value is JSON
+    quoted so embedded newlines cannot masquerade as new authoritative fields.
     """
 
     if max_chars <= 0:
@@ -102,7 +103,7 @@ def render_rehydrate(state: ProtectedTaskState, *, max_chars: int = 8_192) -> st
         break
 
     if state.next_action and remaining > 0:
-        next_section = f"\nNext action:\n- {state.next_action}\n"
+        next_section = f"\nNext action:\n- {_quote(state.next_action)}\n"
         if len(next_section) <= remaining:
             parts.append(next_section)
         else:
@@ -116,11 +117,11 @@ def render_rehydrate(state: ProtectedTaskState, *, max_chars: int = 8_192) -> st
 def _render_protected(state: ProtectedTaskState) -> str:
     lines = [
         "Protected task state (authoritative; do not infer replacements):",
-        f"- task_id: {state.task_id}",
-        f"- attempt_id: {state.attempt_id}",
-        f"- base_sha: {state.base_sha or '-'}",
-        f"- workspace: {state.workspace or '-'}",
-        f"- fingerprint: {state.fingerprint()}",
+        f"- task_id: {_quote(state.task_id)}",
+        f"- attempt_id: {_quote(state.attempt_id)}",
+        f"- base_sha: {_quote(state.base_sha)}",
+        f"- workspace: {_quote(state.workspace)}",
+        f"- fingerprint: {_quote(state.fingerprint())}",
     ]
     lines.extend(_list_lines("Acceptance criteria", state.acceptance_criteria))
     lines.extend(_list_lines("Accepted results", state.accepted_results))
@@ -131,19 +132,23 @@ def _render_protected(state: ProtectedTaskState) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _quote(value: str | None) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
 def _list_lines(title: str, items: tuple[str, ...]) -> list[str]:
     lines = [f"{title}:"]
     if not items:
         lines.append("- -")
         return lines
-    lines.extend(f"- {item}" for item in items)
+    lines.extend(f"- {_quote(item)}" for item in items)
     return lines
 
 
 def _render_list_section(title: str, items: tuple[str, ...]) -> str:
     if not items:
         return ""
-    return "\n" + "\n".join([f"{title}:", *(f"- {item}" for item in items)]) + "\n"
+    return "\n" + "\n".join([f"{title}:", *(f"- {_quote(item)}" for item in items)]) + "\n"
 
 
 def _clip_section(title: str, items: tuple[str, ...], remaining: int) -> str:
@@ -155,7 +160,7 @@ def _clip_section(title: str, items: tuple[str, ...], remaining: int) -> str:
         return ""
     output = prefix
     for item in items:
-        line = f"- {item}\n"
+        line = f"- {_quote(item)}\n"
         if len(output) + len(line) + len(marker) > remaining:
             output += marker
             return output
