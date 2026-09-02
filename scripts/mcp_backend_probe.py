@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import http.client
 import json
 import os
+import re
 import socket
 import urllib.error
 import urllib.request
@@ -25,6 +28,12 @@ class BackendProbe:
     cause_type: str | None = None
     cause_message: str | None = None
     recovery_hint: str | None = None
+    permission_mode: str | None = None
+    filesystem_scope: str | None = None
+    dangerously_skip_all_permissions: bool | None = None
+    dangerously_allow_any_local_path: bool | None = None
+    annotation_override: str | None = None
+    computer_use_enabled: bool | None = None
 
 
 class BackendProbeError(RuntimeError):
@@ -48,6 +57,23 @@ class BackendProbeError(RuntimeError):
         self.cause_type = cause_type
         self.cause_message = cause_message
         self.recovery_hint = recovery_hint
+
+
+def tool_catalog_sha256(tools: tuple[str, ...] | list[str]) -> str:
+    normalized = "\n".join(sorted({str(tool) for tool in tools if str(tool)}))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def load_authorization_header(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        value = path.expanduser().resolve(strict=True).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError("authorization header file could not be read") from exc
+    if re.fullmatch(r"Bearer [A-Za-z0-9._~+/=-]{16,4096}", value) is None:
+        raise ValueError("authorization header file must contain one Bearer credential")
+    return value
 
 
 def _parse_response(raw: bytes, content_type: str) -> dict[str, Any] | None:
@@ -74,17 +100,21 @@ def _post(
     protocol_version: str,
     timeout: float,
     expect_reply: bool,
+    authorization_header: str | None = None,
 ) -> dict[str, Any] | None:
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+        "MCP-Protocol-Version": protocol_version,
+    }
+    if authorization_header:
+        headers["Authorization"] = authorization_header
     request = urllib.request.Request(
         endpoint,
         data=body,
         method="POST",
-        headers={
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-            "MCP-Protocol-Version": protocol_version,
-        },
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -107,7 +137,7 @@ def _post(
                 else "Keep the tunnel unpublished until the local backend passes its MCP readiness probe."
             ),
         ) from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
         underlying = exc.reason if isinstance(exc, urllib.error.URLError) else exc
         cause_type = type(underlying).__name__
         if isinstance(underlying, (TimeoutError, socket.timeout)):
@@ -151,6 +181,7 @@ def _request(
     *,
     protocol_version: str,
     timeout: float,
+    authorization_header: str | None = None,
 ) -> dict[str, Any]:
     payload = _post(
         endpoint,
@@ -158,6 +189,7 @@ def _request(
         protocol_version=protocol_version,
         timeout=timeout,
         expect_reply=True,
+        authorization_header=authorization_header,
     )
     assert payload is not None
     if payload.get("id") not in (request_id, None):
@@ -186,6 +218,7 @@ def probe_mcp_backend(
     expected_workspace: str,
     required_tools: tuple[str, ...],
     timeout: float,
+    authorization_header: str | None = None,
 ) -> BackendProbe:
     protocol_version = "2025-11-25"
     try:
@@ -200,6 +233,7 @@ def probe_mcp_backend(
             },
             protocol_version=protocol_version,
             timeout=timeout,
+            authorization_header=authorization_header,
         )
         negotiated = initialized.get("protocolVersion")
         if isinstance(negotiated, str) and negotiated:
@@ -210,6 +244,7 @@ def probe_mcp_backend(
             protocol_version=protocol_version,
             timeout=timeout,
             expect_reply=False,
+            authorization_header=authorization_header,
         )
         listed = _request(
             endpoint,
@@ -218,6 +253,7 @@ def probe_mcp_backend(
             {},
             protocol_version=protocol_version,
             timeout=timeout,
+            authorization_header=authorization_header,
         )
         raw_tools = listed.get("tools")
         if not isinstance(raw_tools, list):
@@ -249,6 +285,7 @@ def probe_mcp_backend(
             {"name": "server_info", "arguments": {}},
             protocol_version=protocol_version,
             timeout=timeout,
+            authorization_header=authorization_header,
         )
         structured = called.get("structuredContent")
         if not isinstance(structured, dict):
@@ -276,6 +313,37 @@ def probe_mcp_backend(
             tool_count=len(tool_names),
             tools=tool_names,
             backend_state="ready",
+            permission_mode=(
+                structured.get("permission_mode")
+                if isinstance(structured.get("permission_mode"), str)
+                else None
+            ),
+            filesystem_scope=(
+                structured.get("filesystem_scope")
+                if isinstance(structured.get("filesystem_scope"), str)
+                else None
+            ),
+            dangerously_skip_all_permissions=(
+                structured.get("dangerously_skip_all_permissions")
+                if isinstance(structured.get("dangerously_skip_all_permissions"), bool)
+                else None
+            ),
+            dangerously_allow_any_local_path=(
+                structured.get("dangerously_allow_any_local_path")
+                if isinstance(structured.get("dangerously_allow_any_local_path"), bool)
+                else None
+            ),
+            annotation_override=(
+                structured.get("annotation_override")
+                if isinstance(structured.get("annotation_override"), str)
+                else None
+            ),
+            computer_use_enabled=(
+                structured.get("computer_use", {}).get("enabled")
+                if isinstance(structured.get("computer_use"), dict)
+                and isinstance(structured["computer_use"].get("enabled"), bool)
+                else None
+            ),
         )
     except BackendProbeError as exc:
         return BackendProbe(

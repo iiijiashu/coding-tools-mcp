@@ -33,6 +33,7 @@ from typing import Any, cast
 
 from . import __version__
 from . import computer as computer_tools
+from .control_plane import control_plane_command_violation, is_protected_control_plane_path
 from .envutils import ENV_PREFIX, truthy_env
 from .errors import JsonRpcError, ToolFailure
 from .landlock_exec import libc_syscall
@@ -512,6 +513,7 @@ class RuntimePolicy:
     allow_network: bool
     outside_read_policy: str
     fake_readonly_annotations: bool = False
+    allow_any_local_path: bool = False
 
 
 OAUTH_TOKEN_AUTH_METHODS = ("client_secret_basic", "client_secret_post", "none")
@@ -717,6 +719,17 @@ def fake_readonly_annotations_from_args(args: argparse.Namespace, permission_mod
     return requested
 
 
+def allow_any_local_path_from_args(args: argparse.Namespace, permission_mode: str) -> bool:
+    requested = bool(getattr(args, "dangerously_allow_any_local_path", False)) or truthy_env(
+        os.environ.get(f"{ENV_PREFIX}_DANGEROUSLY_ALLOW_ANY_LOCAL_PATH")
+    )
+    if requested and permission_mode != "dangerous":
+        raise ValueError(
+            "--dangerously-allow-any-local-path requires --permission-mode dangerous"
+        )
+    return requested
+
+
 def runtime_policy_from_args(args: argparse.Namespace) -> RuntimePolicy:
     permission_mode = permission_mode_from_args(args)
     allow_network = (
@@ -730,6 +743,7 @@ def runtime_policy_from_args(args: argparse.Namespace) -> RuntimePolicy:
         allow_network=allow_network,
         outside_read_policy=outside_read_policy_from_args(args),
         fake_readonly_annotations=fake_readonly_annotations_from_args(args, permission_mode),
+        allow_any_local_path=allow_any_local_path_from_args(args, permission_mode),
     )
 
 
@@ -1328,6 +1342,7 @@ class Workspace:
         *,
         read_roots: list[Path] | tuple[Path, ...] = (),
         outside_read_policy: str = "deny",
+        allow_any_local_path: bool = False,
     ) -> None:
         self.root = root.expanduser().resolve(strict=True)
         if not self.root.is_dir():
@@ -1347,6 +1362,7 @@ class Workspace:
                 details={"supported": list(OUTSIDE_READ_POLICY_CHOICES)},
             )
         self.outside_read_policy = outside_read_policy
+        self.allow_any_local_path = allow_any_local_path
         configured_read_roots: list[Path] = []
         for configured_root in read_roots:
             read_root = configured_root.expanduser().resolve(strict=True)
@@ -1361,9 +1377,102 @@ class Workspace:
         self.read_roots = tuple(configured_read_roots)
         self.git_path = shutil.which("git")
 
+    @staticmethod
+    def _is_absolute_path(raw_path: str) -> bool:
+        return (
+            Path(raw_path).is_absolute()
+            or raw_path.startswith("/")
+            or re.match(r"^[A-Za-z]:[\\/]", raw_path) is not None
+        )
+
+    @staticmethod
+    def _validate_path_text(raw_path: str) -> None:
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ToolFailure("INVALID_ARGUMENT", "Path must be a non-empty string.", category="validation")
+        if "\x00" in raw_path:
+            raise ToolFailure("INVALID_ARGUMENT", "Path contains a NUL byte.", category="validation")
+
+    def _unrestricted_absolute_candidate(self, raw_path: str) -> Path:
+        self._validate_path_text(raw_path)
+        if not self._is_absolute_path(raw_path):
+            raise ToolFailure("INVALID_ARGUMENT", "Path must be absolute.", category="validation")
+        if os.name == "nt":
+            normalized = raw_path.replace("/", "\\")
+            if normalized.startswith("\\\\"):
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "UNC and Windows device paths are not allowed.",
+                    category="security",
+                )
+            if re.match(r"^[A-Za-z]:\\", normalized) is None:
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "An absolute local drive path is required.",
+                    category="validation",
+                )
+            if self._windows_drive_type(normalized[:3]) not in {2, 3, 5, 6}:
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "The path must use an available local drive, not a mapped network drive.",
+                    category="security",
+                )
+            if ":" in normalized[2:]:
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "Windows alternate data streams are not allowed.",
+                    category="security",
+                )
+            for component in normalized[3:].split("\\"):
+                if not component:
+                    continue
+                canonical_component = component.rstrip(" .")
+                if canonical_component != component:
+                    raise ToolFailure(
+                        "INVALID_ARGUMENT",
+                        "Windows path components may not end in a space or dot.",
+                        category="security",
+                    )
+                device_base = canonical_component.split(".", 1)[0].upper()
+                if device_base in {"CON", "PRN", "AUX", "NUL"} or re.fullmatch(
+                    r"(?:COM|LPT)[1-9]", device_base
+                ):
+                    raise ToolFailure(
+                        "INVALID_ARGUMENT",
+                        "Windows reserved device names are not allowed.",
+                        category="security",
+                    )
+        return Path(raw_path)
+
+    @staticmethod
+    def _windows_drive_type(root: str) -> int:
+        try:
+            get_drive_type = ctypes.windll.kernel32.GetDriveTypeW
+            get_drive_type.argtypes = [ctypes.c_wchar_p]
+            get_drive_type.restype = ctypes.c_uint
+            return int(get_drive_type(root))
+        except (AttributeError, OSError) as exc:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "Windows local-drive identity could not be verified.",
+                category="security",
+            ) from exc
+
+    def _validate_unrestricted_resolved(self, resolved: Path) -> Path:
+        # Revalidate the canonical target so a local-looking junction cannot
+        # redirect unrestricted access to a UNC or mapped-network location.
+        self._unrestricted_absolute_candidate(str(resolved))
+        return resolved
+
     def read_access_root(self, path: Path) -> Path | None:
         if is_relative_to(path, self.root):
             return self.root
+        if self.allow_any_local_path:
+            try:
+                resolved = path.resolve(strict=True)
+                self._validate_unrestricted_resolved(resolved)
+            except (OSError, ToolFailure):
+                return None
+            return resolved if resolved.is_dir() else resolved.parent
         matches = [root for root in self.read_roots if is_relative_to(path, root)]
         return max(matches, key=lambda item: len(item.parts), default=None)
 
@@ -1373,11 +1482,8 @@ class Workspace:
         return str(path)
 
     def _reject_unsafe_text(self, raw_path: str) -> PurePosixPath:
-        if not isinstance(raw_path, str) or not raw_path:
-            raise ToolFailure("INVALID_ARGUMENT", "Path must be a non-empty string.", category="validation")
-        if "\x00" in raw_path:
-            raise ToolFailure("INVALID_ARGUMENT", "Path contains a NUL byte.", category="validation")
-        if raw_path.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", raw_path):
+        self._validate_path_text(raw_path)
+        if self._is_absolute_path(raw_path):
             raise ToolFailure("ABSOLUTE_PATH_DENIED", "Absolute paths are denied.", category="security")
         pure = PurePosixPath(raw_path)
         if any(part == ".." for part in pure.parts):
@@ -1385,7 +1491,16 @@ class Workspace:
         return pure
 
     def resolve_existing(self, raw_path: str = ".") -> ResolvedPath:
-        pure = self._reject_unsafe_text(raw_path or ".")
+        raw_path = raw_path or "."
+        if self.allow_any_local_path and self._is_absolute_path(raw_path):
+            candidate = self._unrestricted_absolute_candidate(raw_path)
+            try:
+                resolved = candidate.resolve(strict=True)
+            except FileNotFoundError as exc:
+                raise ToolFailure("NOT_FOUND", f"Path not found: {raw_path}", category="not_found") from exc
+            self._validate_unrestricted_resolved(resolved)
+            return ResolvedPath(str(resolved), resolved, True)
+        pure = self._reject_unsafe_text(raw_path)
         candidate = self.root.joinpath(*pure.parts)
         try:
             resolved = candidate.resolve(strict=True)
@@ -1397,19 +1512,22 @@ class Workspace:
         return ResolvedPath(normalize_rel_display(resolved, self.root), resolved, True)
 
     def resolve_for_read(self, raw_path: str = ".") -> ResolvedPath:
-        if not isinstance(raw_path, str) or not raw_path:
-            raise ToolFailure("INVALID_ARGUMENT", "Path must be a non-empty string.", category="validation")
-        if "\x00" in raw_path:
-            raise ToolFailure("INVALID_ARGUMENT", "Path contains a NUL byte.", category="validation")
-        is_absolute = Path(raw_path).is_absolute() or re.match(r"^[A-Za-z]:[\\/]", raw_path) is not None
+        self._validate_path_text(raw_path)
+        is_absolute = self._is_absolute_path(raw_path)
         if not is_absolute:
             return self.resolve_existing(raw_path)
-        candidate = Path(raw_path)
+        candidate = (
+            self._unrestricted_absolute_candidate(raw_path)
+            if self.allow_any_local_path
+            else Path(raw_path)
+        )
         try:
             resolved = candidate.resolve(strict=True)
         except FileNotFoundError as exc:
             raise ToolFailure("NOT_FOUND", f"Path not found: {raw_path}", category="not_found") from exc
-        if self.read_access_root(resolved) is None:
+        if self.allow_any_local_path:
+            self._validate_unrestricted_resolved(resolved)
+        if not self.allow_any_local_path and self.read_access_root(resolved) is None:
             if self.outside_read_policy == "request":
                 raise ToolFailure(
                     "PERMISSION_REQUIRED",
@@ -1431,15 +1549,25 @@ class Workspace:
         return ResolvedPath(self.display_read_path(resolved), resolved, True)
 
     def resolve_for_write(self, raw_path: str) -> ResolvedPath:
-        pure = self._reject_unsafe_text(raw_path)
-        if pure.name in {"", ".", ".."}:
+        absolute = self._is_absolute_path(raw_path)
+        if absolute and self.allow_any_local_path:
+            candidate = self._unrestricted_absolute_candidate(raw_path)
+            display = str
+        else:
+            pure = self._reject_unsafe_text(raw_path)
+            candidate = self.root.joinpath(*pure.parts)
+
+            def display(path: Path) -> str:
+                return normalize_rel_display(path, self.root)
+        if candidate.name in {"", ".", ".."}:
             raise ToolFailure("INVALID_ARGUMENT", "Invalid write target.", category="validation")
-        candidate = self.root.joinpath(*pure.parts)
         if candidate.exists() or candidate.is_symlink():
             resolved = candidate.resolve(strict=True)
-            if not is_relative_to(resolved, self.root):
+            if absolute and self.allow_any_local_path:
+                self._validate_unrestricted_resolved(resolved)
+            if not absolute and not is_relative_to(resolved, self.root):
                 raise ToolFailure("SYMLINK_ESCAPE", "Path escapes the configured workspace.", category="security")
-            return ResolvedPath(normalize_rel_display(resolved, self.root), resolved, True)
+            return ResolvedPath(display(resolved), resolved, True)
 
         parent = candidate.parent
         missing: list[Path] = []
@@ -1452,14 +1580,19 @@ class Workspace:
             resolved_parent = parent.resolve(strict=True)
         except FileNotFoundError as exc:
             raise ToolFailure("NOT_FOUND", f"Parent directory not found: {raw_path}", category="not_found") from exc
-        if not is_relative_to(resolved_parent, self.root):
+        if absolute and self.allow_any_local_path:
+            self._validate_unrestricted_resolved(resolved_parent)
+        if not absolute and not is_relative_to(resolved_parent, self.root):
             raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Path escapes the configured workspace.", category="security")
         target = resolved_parent.joinpath(*reversed([p.name for p in missing]), candidate.name)
-        return ResolvedPath(normalize_rel_display(target, self.root), target, False)
+        return ResolvedPath(display(target), target, False)
 
     def reject_write_symlink(self, raw_path: str) -> None:
-        pure = self._reject_unsafe_text(raw_path)
-        candidate = self.root.joinpath(*pure.parts)
+        if self.allow_any_local_path and self._is_absolute_path(raw_path):
+            candidate = self._unrestricted_absolute_candidate(raw_path)
+        else:
+            pure = self._reject_unsafe_text(raw_path)
+            candidate = self.root.joinpath(*pure.parts)
         if candidate.is_symlink():
             raise ToolFailure("SYMLINK_ESCAPE", "Writing through symlinks is denied.", category="security")
 
@@ -1600,13 +1733,33 @@ class Runtime:
         oauth_config: OAuthConfig | None = None,
         project_context: ProjectContext | None = None,
         fake_readonly_annotations: bool = False,
+        allow_any_local_path: bool = False,
         transport: str = "stdio",
         command_manager: WorkspaceCommandManager | None = None,
     ) -> None:
+        if allow_any_local_path and permission_mode != "dangerous":
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "allow_any_local_path requires permission_mode=dangerous.",
+                category="validation",
+            )
+        if allow_any_local_path and transport != "http":
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "allow_any_local_path is available only over authenticated HTTP.",
+                category="security",
+            )
+        if allow_any_local_path and not (auth_token or oauth_config):
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "allow_any_local_path requires bearer or OAuth authentication.",
+                category="security",
+            )
         self.workspace = Workspace(
             workspace,
             read_roots=read_roots,
             outside_read_policy=outside_read_policy,
+            allow_any_local_path=allow_any_local_path,
         )
         self.enable_view_image = enable_view_image
         self.enable_computer_use = enable_computer_use
@@ -1908,6 +2061,9 @@ class Runtime:
             "workspace": str(self.workspace.root),
             "read_roots": [str(root) for root in self.workspace.read_roots],
             "outside_read_policy": self.workspace.outside_read_policy,
+            "filesystem_scope": (
+                "all_local_drives" if self.workspace.allow_any_local_path else "workspace_and_read_roots"
+            ),
             "permission_mode": self.permission_mode,
             "network_allowed": self.allow_network,
             "runtime_dir": str(self.runtime_dir),
@@ -2014,6 +2170,7 @@ class Runtime:
             **self._exec_environment_summary(),
             "auth_enabled": self.auth_enabled(),
             "dangerously_skip_all_permissions": self.dangerously_skip_all_permissions,
+            "dangerously_allow_any_local_path": self.workspace.allow_any_local_path,
             "annotation_override": "fake_readonly" if self.fake_readonly_annotations else None,
             "landlock": landlock,
             "exec_policy": {
@@ -2791,10 +2948,14 @@ class Runtime:
             removals = 0
             for op in operations:
                 self._validate_patch_path(op.path, require_existing=op.kind in {"update", "delete"})
+                if not dry_run:
+                    self._reject_control_plane_patch_path(op.path)
                 if op.kind in {"add", "update", "delete"}:
                     self.workspace.reject_write_symlink(op.path)
                 if op.move_to:
                     self._validate_patch_path(op.move_to, require_existing=False)
+                    if not dry_run:
+                        self._reject_control_plane_patch_path(op.move_to)
                     self.workspace.reject_write_symlink(op.move_to)
                 if op.kind == "add":
                     target = self.workspace.resolve_for_write(op.path)
@@ -2887,6 +3048,20 @@ class Runtime:
             self.workspace.resolve_existing(raw_path)
         else:
             self.workspace.resolve_for_write(raw_path)
+
+    def _reject_control_plane_patch_path(self, raw_path: str) -> None:
+        target = self.workspace.resolve_for_write(raw_path).path
+        if is_protected_control_plane_path(target, self.workspace.root):
+            raise ToolFailure(
+                "CONTROL_PLANE_LEASE_REQUIRED",
+                "The production MCP task config may only be changed by the control-plane transaction manager.",
+                category="permission",
+                details={
+                    "permission": "control_plane_transaction",
+                    "path": str(target),
+                    "dangerous_mode_bypassable": False,
+                },
+            )
 
     def _commit_staged_files(self, staged: list[StagedFile]) -> None:
         self.patch_committer.commit(staged)
@@ -3045,6 +3220,18 @@ class Runtime:
             time.sleep(0.02)
 
     def _check_command_policy(self, cmd: str, args: dict[str, Any]) -> None:
+        control_plane_violation = control_plane_command_violation(cmd)
+        if control_plane_violation is not None:
+            raise ToolFailure(
+                control_plane_violation.code,
+                control_plane_violation.message,
+                category="permission",
+                details={
+                    "permission": "control_plane_transaction",
+                    "evidence": control_plane_violation.evidence,
+                    "dangerous_mode_bypassable": False,
+                },
+            )
         if self.dangerously_skip_all_permissions:
             return
         self._check_command_paths(cmd)
@@ -6480,6 +6667,7 @@ def build_runtime(
         oauth_config=oauth_config,
         project_context=project_context,
         fake_readonly_annotations=runtime_policy.fake_readonly_annotations,
+        allow_any_local_path=runtime_policy.allow_any_local_path,
         transport=transport,
         command_manager=command_manager,
     )
@@ -6493,6 +6681,13 @@ def build_runtime(
             "WARNING: tools/list reports every tool as read-only and non-destructive. "
             "apply_patch and exec_command still mutate the workspace and still run commands. "
             "server_info and the server card keep reporting the real annotations.",
+            file=sys.stderr,
+        )
+    if emit_warning and runtime.workspace.allow_any_local_path:
+        print(
+            "WARNING: authenticated callers may read and modify absolute paths on any local drive. "
+            "UNC and mapped-network paths, device/ADS/reserved-device paths, and relative parent escapes remain "
+            "blocked.",
             file=sys.stderr,
         )
     return runtime
@@ -6608,6 +6803,15 @@ def run_http(args: argparse.Namespace) -> int:
         )
         return 2
 
+    if runtime_policy.allow_any_local_path and not auth_token and not oauth_config:
+        print(
+            "ERROR: --dangerously-allow-any-local-path over HTTP requires --auth-token, "
+            f"{ENV_PREFIX}_AUTH_TOKEN, or --oauth-mode. "
+            "Anonymous loopback callers must never receive unrestricted filesystem access.",
+            file=sys.stderr,
+        )
+        return 2
+
     workspace = Path(args.workspace or os.environ.get(f"{ENV_PREFIX}_WORKSPACE") or os.getcwd())
     lease = HTTPInstanceLease(str(args.host), int(args.port), workspace)
     try:
@@ -6698,6 +6902,12 @@ def run_stdio(args: argparse.Namespace) -> int:
         runtime_policy = runtime_policy_from_args(args)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if runtime_policy.allow_any_local_path:
+        print(
+            "ERROR: --dangerously-allow-any-local-path is only available over authenticated HTTP.",
+            file=sys.stderr,
+        )
         return 2
     runtime = build_runtime(args, runtime_policy)
     return serve_stdio(runtime)
@@ -6808,6 +7018,16 @@ def build_parser() -> argparse.ArgumentParser:
             "annotations; mutation and execution still happen; requires --permission-mode dangerous, and "
             "requires auth over HTTP; server_info and the server card keep reporting the real annotations; "
             f"can also be enabled with {ENV_PREFIX}_DANGEROUSLY_FAKE_READONLY_ANNOTATIONS=1"
+        ),
+    )
+    parser.add_argument(
+        "--dangerously-allow-any-local-path",
+        action="store_true",
+        help=(
+            "allow authenticated HTTP callers to use absolute paths on verified local drives for direct file/image "
+            "tools, apply_patch, exec_command workdir, git_status, and Computer Use launch paths; other Git helpers "
+            "remain workspace-repo scoped; requires --permission-mode dangerous; UNC/mapped-network/device/ADS "
+            f"paths remain blocked; can also be enabled with {ENV_PREFIX}_DANGEROUSLY_ALLOW_ANY_LOCAL_PATH=1"
         ),
     )
     return parser

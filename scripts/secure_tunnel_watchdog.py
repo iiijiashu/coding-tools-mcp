@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """Repair a Windows Secure MCP Tunnel task when it exits or becomes unhealthy.
 
-The primary scheduled task continues to own ``tunnel-client.exe``.  This
-watchdog is intentionally short lived so Task Scheduler can run it once per
-minute without creating a second long-lived process tree.
+The primary scheduled task continues to own ``tunnel-client.exe``.  The
+watchdog can run once or remain alive for the duration of an interactive
+session, avoiding repeated Task Scheduler launches that require a fresh
+interactive token.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,10 +24,20 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .mcp_backend_probe import BackendProbe, probe_mcp_backend
+    from .mcp_backend_probe import (  # noqa: F401
+        BackendProbe,
+        load_authorization_header,
+        probe_mcp_backend,
+        tool_catalog_sha256,
+    )
 except ImportError:  # direct script execution
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from mcp_backend_probe import BackendProbe, probe_mcp_backend
+    from mcp_backend_probe import (  # noqa: F401
+        BackendProbe,
+        load_authorization_header,
+        probe_mcp_backend,
+        tool_catalog_sha256,
+    )
 
 
 RUNNING = "Running"
@@ -34,8 +47,10 @@ HEALTHY = "healthy"
 LOCAL_UNHEALTHY = "local_unhealthy"
 CONTROL_PLANE_DEGRADED = "control_plane_degraded"
 DEADLINE_DEGRADED = "deadline_degraded"
+COMMAND_DEADLINE_OBSERVED = "command_deadline_observed"
 DEADLINE_MESSAGE = "command response deadline reached; dropping without posting a response"
 DEFAULT_RECOVERY_BACKOFF_SECONDS = (60.0, 120.0, 300.0, 600.0, 1800.0)
+TASK_REQUEST_REFUSED = 0x800710E0
 
 
 @dataclass(frozen=True)
@@ -48,6 +63,7 @@ class Decision:
 class Config:
     main_task_name: str
     tunnel_client: Path
+    tunnel_client_sha256: str
     health_url_file: Path
     pid_file: Path
     state_file: Path
@@ -65,6 +81,10 @@ class Config:
     stable_health_seconds: float = 300.0
     event_log_max_bytes: int = 5 * 1024 * 1024
     event_log_backups: int = 3
+    backend_authorization_header_file: Path | None = None
+    loop_interval_seconds: float = 0.0
+    main_task_arguments_sha256: str | None = None
+    expected_tool_catalog_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,10 +102,17 @@ class HealthProbe:
     control_plane_poll: bool
 
 
-def decide_backend_action(task_state: str, backend_ok: bool) -> str:
+def decide_backend_action(
+    task_state: str,
+    backend_ok: bool,
+    consecutive_failures: int,
+    failure_threshold: int,
+) -> str:
     if backend_ok:
         return "proceed"
     if task_state == RUNNING:
+        if consecutive_failures + 1 < failure_threshold:
+            return "backend_degraded"
         return "stop_backend_unavailable"
     return "hold_backend_unavailable"
 
@@ -110,6 +137,12 @@ def decide_action(
     if health_kind == CONTROL_PLANE_DEGRADED:
         # Restarting a live local process cannot repair an upstream outage.
         return Decision("control_plane_degraded", 0)
+    if health_kind in {DEADLINE_DEGRADED, COMMAND_DEADLINE_OBSERVED}:
+        # A command can exceed its response SLA while the process, health
+        # endpoint, readiness endpoint, and control-plane poll are all healthy.
+        # Restarting the transport cannot deliver an already-expired response
+        # and needlessly drops unrelated in-flight work.
+        return Decision("command_deadline_observed", 0)
     failures = max(0, consecutive_failures) + 1
     if failures >= failure_threshold:
         return Decision("restart", failures)
@@ -126,6 +159,7 @@ def load_state(path: Path) -> dict[str, Any]:
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {
             "consecutive_failures": 0,
+            "backend_consecutive_failures": 0,
             "recovery_attempts": 0,
             "next_recovery_at": 0.0,
             "last_recovery_at": 0.0,
@@ -135,6 +169,7 @@ def load_state(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {
             "consecutive_failures": 0,
+            "backend_consecutive_failures": 0,
             "recovery_attempts": 0,
             "next_recovery_at": 0.0,
             "last_recovery_at": 0.0,
@@ -145,6 +180,10 @@ def load_state(path: Path) -> dict[str, Any]:
         failures = max(0, int(payload.get("consecutive_failures", 0)))
     except (TypeError, ValueError):
         failures = 0
+    try:
+        backend_failures = max(0, int(payload.get("backend_consecutive_failures", 0)))
+    except (TypeError, ValueError):
+        backend_failures = 0
     try:
         attempts = max(0, int(payload.get("recovery_attempts", 0)))
     except (TypeError, ValueError):
@@ -164,6 +203,7 @@ def load_state(path: Path) -> dict[str, Any]:
     return {
         **payload,
         "consecutive_failures": failures,
+        "backend_consecutive_failures": backend_failures,
         "recovery_attempts": attempts,
         "next_recovery_at": next_recovery_at,
         "last_recovery_at": last_recovery_at,
@@ -176,6 +216,7 @@ def save_state(
     path: Path,
     *,
     consecutive_failures: int,
+    backend_consecutive_failures: int = 0,
     last_action: str,
     recovery_attempts: int = 0,
     next_recovery_at: float = 0.0,
@@ -186,6 +227,7 @@ def save_state(
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "consecutive_failures": max(0, consecutive_failures),
+        "backend_consecutive_failures": max(0, backend_consecutive_failures),
         "recovery_attempts": max(0, recovery_attempts),
         "next_recovery_at": max(0.0, next_recovery_at),
         "last_recovery_at": max(0.0, last_recovery_at),
@@ -239,6 +281,8 @@ def run_powershell(config: Config, script: str, *, timeout: float = 20.0) -> sub
     environment = os.environ.copy()
     environment["OPENAI_TUNNEL_TASK_NAME"] = config.main_task_name
     environment["OPENAI_TUNNEL_TASK_PATH"] = config.main_task_path
+    environment["OPENAI_TUNNEL_CLIENT"] = str(config.tunnel_client)
+    environment["OPENAI_TUNNEL_ARGUMENTS_SHA256"] = config.main_task_arguments_sha256 or ""
     prefix = (
         "$ErrorActionPreference='Stop';"
         "$OutputEncoding=[Console]::OutputEncoding=[Text.UTF8Encoding]::new();"
@@ -290,15 +334,72 @@ def task_status(config: Config) -> TaskStatus:
 
 
 def start_task(config: Config) -> None:
+    reregister_task(config)
+
+
+def _require_main_task_arguments_pin(config: Config) -> None:
+    if not config.main_task_arguments_sha256:
+        raise RuntimeError("primary tunnel task arguments SHA-256 pin is required before lifecycle recovery")
+
+
+def reregister_task(config: Config) -> None:
+    _require_main_task_arguments_pin(config)
     result = run_powershell(
         config,
-        "Start-ScheduledTask -TaskPath $env:OPENAI_TUNNEL_TASK_PATH -TaskName $env:OPENAI_TUNNEL_TASK_NAME",
+        "$task=Get-ScheduledTask -TaskPath $env:OPENAI_TUNNEL_TASK_PATH -TaskName $env:OPENAI_TUNNEL_TASK_NAME;"
+        "if([string]$task.State -eq 'Disabled'){exit 23};"
+        "$raw=Export-ScheduledTask -TaskPath $env:OPENAI_TUNNEL_TASK_PATH -TaskName $env:OPENAI_TUNNEL_TASK_NAME;"
+        "[xml]$xml=$raw;$ns=New-Object Xml.XmlNamespaceManager($xml.NameTable);"
+        "$ns.AddNamespace('t','http://schemas.microsoft.com/windows/2004/02/mit/task');"
+        "if(-not $xml.SelectSingleNode('//t:RegistrationTrigger',$ns)){exit 24};"
+        "$actionsNode=$xml.SelectSingleNode('//t:Actions',$ns);"
+        "$actionNodes=@($actionsNode.ChildNodes|Where-Object {$_.NodeType -eq [Xml.XmlNodeType]::Element});"
+        "if($actionNodes.Count -ne 1 -or $actionNodes[0].LocalName -ne 'Exec'){exit 25};"
+        "$identity=[Security.Principal.WindowsIdentity]::GetCurrent();"
+        "$user=[string]$xml.SelectSingleNode('//t:Principal/t:UserId',$ns).InnerText;"
+        "$short=($identity.Name -split '\\\\')[-1];"
+        "if($user -notin @($identity.User.Value,$identity.Name,$short)){exit 27};"
+        "$level=[string]$xml.SelectSingleNode('//t:Principal/t:RunLevel',$ns).InnerText;"
+        "if($level -and $level -ne 'LeastPrivilege'){exit 28};"
+        "$multiple=[string]$xml.SelectSingleNode('//t:Settings/t:MultipleInstancesPolicy',$ns).InnerText;"
+        "if($multiple -ne 'IgnoreNew'){exit 29};"
+        "$command=[string]$xml.SelectSingleNode('//t:Actions/t:Exec/t:Command',$ns).InnerText;"
+        "if([IO.Path]::GetFullPath($command) -ne [IO.Path]::GetFullPath($env:OPENAI_TUNNEL_CLIENT)){exit 25};"
+        "$logonType=[string]$xml.SelectSingleNode('//t:Principal/t:LogonType',$ns).InnerText;"
+        "if($logonType -ne 'InteractiveToken'){exit 26};"
+        "$arguments=[string]$xml.SelectSingleNode('//t:Actions/t:Exec/t:Arguments',$ns).InnerText;"
+        "if($env:OPENAI_TUNNEL_ARGUMENTS_SHA256){$sha=[Security.Cryptography.SHA256]::Create();"
+        "try{$bytes=[Text.Encoding]::UTF8.GetBytes($arguments);$actual=([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()};"
+        "if($actual -cne $env:OPENAI_TUNNEL_ARGUMENTS_SHA256){exit 30}};"
+        "$working=[string]$xml.SelectSingleNode('//t:Actions/t:Exec/t:WorkingDirectory',$ns).InnerText;"
+        "if(-not [string]::IsNullOrWhiteSpace($working)){exit 31};"
+        "Register-ScheduledTask -TaskPath $env:OPENAI_TUNNEL_TASK_PATH "
+        "-TaskName $env:OPENAI_TUNNEL_TASK_NAME -Xml $raw -Force|Out-Null",
     )
+    if result.returncode == 23:
+        raise RuntimeError("primary tunnel task was disabled before re-registration")
+    if result.returncode == 24:
+        raise RuntimeError("primary tunnel task has no registration recovery trigger")
+    if result.returncode == 25:
+        raise RuntimeError("primary tunnel task action changed before re-registration")
+    if result.returncode == 26:
+        raise RuntimeError("primary tunnel task logon type changed before re-registration")
+    if result.returncode == 27:
+        raise RuntimeError("primary tunnel task principal changed before re-registration")
+    if result.returncode == 28:
+        raise RuntimeError("primary tunnel task run level changed before re-registration")
+    if result.returncode == 29:
+        raise RuntimeError("primary tunnel task single-instance policy changed before re-registration")
+    if result.returncode == 30:
+        raise RuntimeError("primary tunnel task arguments changed before re-registration")
+    if result.returncode == 31:
+        raise RuntimeError("primary tunnel task working directory changed before re-registration")
     if result.returncode != 0:
-        raise RuntimeError("could not start the primary tunnel task")
+        raise RuntimeError("could not re-register the primary tunnel task")
 
 
 def restart_task(config: Config) -> None:
+    _require_main_task_arguments_pin(config)
     result = run_powershell(
         config,
         "$task=Get-ScheduledTask -TaskPath $env:OPENAI_TUNNEL_TASK_PATH -TaskName $env:OPENAI_TUNNEL_TASK_NAME;"
@@ -307,13 +408,16 @@ def restart_task(config: Config) -> None:
         "$deadline=(Get-Date).AddSeconds(10);"
         "do{$task=Get-ScheduledTask -TaskPath $env:OPENAI_TUNNEL_TASK_PATH -TaskName $env:OPENAI_TUNNEL_TASK_NAME;"
         "if([string]$task.State -ne 'Running'){break};Start-Sleep -Milliseconds 250}while((Get-Date)-lt $deadline);"
-        "Start-ScheduledTask -TaskPath $env:OPENAI_TUNNEL_TASK_PATH -TaskName $env:OPENAI_TUNNEL_TASK_NAME",
+        "if([string]$task.State -eq 'Running'){exit 32}",
         timeout=25.0,
     )
     if result.returncode == 23:
         raise RuntimeError("primary tunnel task was disabled during restart")
+    if result.returncode == 32:
+        raise RuntimeError("primary tunnel task did not stop before re-registration")
     if result.returncode != 0:
         raise RuntimeError("could not restart the primary tunnel task")
+    reregister_task(config)
 
 
 def stop_task(config: Config) -> None:
@@ -433,6 +537,7 @@ def record(
     action: str,
     status: TaskStatus,
     failures: int,
+    backend_failures: int,
     recovery_attempts: int,
     next_recovery_at: float,
     last_recovery_at: float,
@@ -449,6 +554,7 @@ def record(
         task_state=status.state,
         last_task_result=status.last_task_result,
         consecutive_failures=failures,
+        backend_consecutive_failures=backend_failures,
         healthy=probe.ok if probe is not None else None,
         health_kind=probe.kind if probe is not None else None,
         pid=current_pid(config.pid_file) if status.state == RUNNING else None,
@@ -460,6 +566,7 @@ def record(
     save_state(
         config.state_file,
         consecutive_failures=failures,
+        backend_consecutive_failures=backend_failures,
         last_action=action,
         recovery_attempts=recovery_attempts,
         next_recovery_at=next_recovery_at,
@@ -474,28 +581,53 @@ def recovery_delay(config: Config, attempt: int) -> float:
     return config.recovery_backoff_seconds[index]
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def run_once(config: Config) -> int:
     if os.name != "nt":
         raise RuntimeError("the Secure MCP Tunnel watchdog requires Windows")
     for required in (config.tunnel_client, config.powershell):
         if not required.is_file():
             raise RuntimeError(f"required executable is missing: {required}")
+    if file_sha256(config.tunnel_client) != config.tunnel_client_sha256:
+        raise RuntimeError("tunnel client fingerprint does not match the runtime contract")
     state = load_state(config.state_file)
     failures = int(state.get("consecutive_failures", 0))
+    backend_failures = int(state.get("backend_consecutive_failures", 0))
     recovery_attempts = int(state.get("recovery_attempts", 0))
     next_recovery_at = float(state.get("next_recovery_at", 0.0))
     last_recovery_at = float(state.get("last_recovery_at", 0.0))
     healthy_since_at = float(state.get("healthy_since_at", 0.0))
     last_deadline_time = str(state.get("last_deadline_time", "") or "")
     status = task_status(config)
+    authorization_header = load_authorization_header(config.backend_authorization_header_file)
     backend = probe_mcp_backend(
         config.backend_url,
         expected_workspace=config.backend_workspace,
         required_tools=config.backend_required_tools,
         timeout=config.health_timeout_seconds,
+        authorization_header=authorization_header,
     )
-    backend_action = decide_backend_action(status.state, backend.ok)
+    actual_catalog_sha256 = tool_catalog_sha256(backend.tools) if backend.tools else None
+    catalog_ok = (
+        config.expected_tool_catalog_sha256 is None
+        or actual_catalog_sha256 == config.expected_tool_catalog_sha256
+    )
+    backend_action = decide_backend_action(
+        status.state,
+        backend.ok and catalog_ok,
+        backend_failures,
+        config.failure_threshold,
+    )
     if backend_action != "proceed":
+        if status.state == RUNNING:
+            backend_failures = min(backend_failures + 1, config.failure_threshold)
         if backend_action == "stop_backend_unavailable":
             stop_task(config)
         append_event(
@@ -513,14 +645,23 @@ def run_once(config: Config) -> int:
             backend_cause_type=backend.cause_type,
             backend_cause_message=backend.cause_message,
             backend_recovery_hint=backend.recovery_hint,
+            tool_catalog_ok=catalog_ok,
+            expected_tool_catalog_sha256=config.expected_tool_catalog_sha256,
+            actual_tool_catalog_sha256=actual_catalog_sha256,
         )
         save_state(
             config.state_file,
-            consecutive_failures=0,
+            consecutive_failures=failures,
+            backend_consecutive_failures=backend_failures,
             last_action=backend_action,
+            recovery_attempts=recovery_attempts,
+            next_recovery_at=next_recovery_at,
+            last_recovery_at=last_recovery_at,
+            healthy_since_at=healthy_since_at,
             last_deadline_time=last_deadline_time,
         )
         return 1
+    backend_failures = 0
     probe = probe_health(config) if status.state == RUNNING else None
     new_deadline_drops = 0
     if status.state == RUNNING:
@@ -529,8 +670,8 @@ def run_once(config: Config) -> int:
         )
         if probe is not None and probe.kind == HEALTHY and new_deadline_drops:
             probe = HealthProbe(
-                DEADLINE_DEGRADED,
-                False,
+                COMMAND_DEADLINE_OBSERVED,
+                True,
                 probe.local_live,
                 probe.ready,
                 probe.control_plane_poll,
@@ -542,14 +683,21 @@ def run_once(config: Config) -> int:
         config.failure_threshold,
     )
 
-    if decision.action in {"disabled", "wait", "healthy", "degraded", "control_plane_degraded"}:
+    if decision.action in {
+        "disabled",
+        "wait",
+        "healthy",
+        "degraded",
+        "control_plane_degraded",
+        "command_deadline_observed",
+    }:
         action = decision.action
         if decision.action == "disabled":
             recovery_attempts = 0
             next_recovery_at = 0.0
             last_recovery_at = 0.0
             healthy_since_at = 0.0
-        elif decision.action == "healthy":
+        elif decision.action in {"healthy", "command_deadline_observed"}:
             now = time.time()
             if recovery_attempts == 0:
                 next_recovery_at = 0.0
@@ -571,6 +719,7 @@ def run_once(config: Config) -> int:
             action=action,
             status=status,
             failures=decision.consecutive_failures,
+            backend_failures=backend_failures,
             recovery_attempts=recovery_attempts,
             next_recovery_at=next_recovery_at,
             last_recovery_at=last_recovery_at,
@@ -583,12 +732,13 @@ def run_once(config: Config) -> int:
 
     if decision.action in {"start", "restart"}:
         now = time.time()
-        if decision.action == "restart" and now < next_recovery_at:
+        if now < next_recovery_at:
             record(
                 config,
                 action=f"{decision.action}_cooldown",
                 status=status,
                 failures=decision.consecutive_failures,
+                backend_failures=backend_failures,
                 recovery_attempts=recovery_attempts,
                 next_recovery_at=next_recovery_at,
                 last_recovery_at=last_recovery_at,
@@ -598,15 +748,6 @@ def run_once(config: Config) -> int:
                 new_deadline_drops=new_deadline_drops,
             )
             return 0
-
-        if decision.action == "start":
-            # A Ready task is not a live restart loop: tunnel-client has already
-            # exited and the one-minute scheduler cadence is the throttle.  Do
-            # not let backoff from an earlier unhealthy-running restart turn a
-            # clean exit into a multi-minute outage.
-            recovery_attempts = 0
-            next_recovery_at = 0.0
-            last_recovery_at = 0.0
 
         # Persist the recovery lease before touching Task Scheduler.  If the
         # process is killed mid-attempt, the next run still observes backoff.
@@ -619,6 +760,7 @@ def run_once(config: Config) -> int:
             action=f"{decision.action}_attempt",
             status=status,
             failures=0,
+            backend_failures=backend_failures,
             recovery_attempts=recovery_attempts,
             next_recovery_at=next_recovery_at,
             last_recovery_at=last_recovery_at,
@@ -634,6 +776,16 @@ def run_once(config: Config) -> int:
             restart_task(config)
         recovered_probe = wait_for_health(config)
         refreshed = task_status(config)
+        completed_action = f"{decision.action}ed"
+        if (
+            not recovered_probe.ok
+            and refreshed.state == READY
+            and refreshed.last_task_result == TASK_REQUEST_REFUSED
+        ):
+            reregister_task(config)
+            recovered_probe = wait_for_health(config)
+            refreshed = task_status(config)
+            completed_action = f"{decision.action}_reregistered"
         if recovered_probe.ok:
             # A process that becomes ready and immediately crashes is still a
             # failure loop.  Keep its backoff lease until it stays healthy for
@@ -641,9 +793,10 @@ def run_once(config: Config) -> int:
             healthy_since_at = time.time()
         record(
             config,
-            action=f"{decision.action}ed_healthy" if recovered_probe.ok else f"{decision.action}ed_unready",
+            action=f"{completed_action}_healthy" if recovered_probe.ok else f"{completed_action}_unready",
             status=refreshed,
             failures=0,
+            backend_failures=backend_failures,
             recovery_attempts=recovery_attempts,
             next_recovery_at=next_recovery_at,
             last_recovery_at=last_recovery_at,
@@ -660,6 +813,41 @@ def run_once(config: Config) -> int:
 def default_powershell() -> Path:
     resolved = shutil.which("powershell.exe") or shutil.which("pwsh.exe")
     return Path(resolved) if resolved else Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+
+
+def record_watchdog_error(config: Config, exc: Exception) -> None:
+    try:
+        append_event(
+            config.event_log,
+            max_bytes=config.event_log_max_bytes,
+            backups=config.event_log_backups,
+            action="watchdog_error",
+            error_type=type(exc).__name__,
+        )
+    except OSError:
+        pass
+    if sys.stderr is not None:
+        print(f"Secure MCP Tunnel watchdog failed: {exc}", file=sys.stderr)
+
+
+def run_loop(
+    config: Config,
+    *,
+    interval_seconds: float,
+    max_iterations: int | None = None,
+) -> int:
+    completed = 0
+    last_result = 0
+    while True:
+        try:
+            last_result = run_once(config)
+        except Exception as exc:  # noqa: BLE001 - a supervisor must survive one failed probe
+            record_watchdog_error(config, exc)
+            last_result = 1
+        completed += 1
+        if max_iterations is not None and completed >= max_iterations:
+            return last_result
+        time.sleep(interval_seconds)
 
 
 def parse_backoff(value: str) -> tuple[float, ...]:
@@ -683,11 +871,18 @@ def normalize_task_path(value: str) -> str:
     return normalized
 
 
+def sha256_value(value: str) -> str:
+    if re.fullmatch(r"[A-Fa-f0-9]{64}", value) is None:
+        raise argparse.ArgumentTypeError("SHA-256 must contain 64 hexadecimal characters")
+    return value.lower()
+
+
 def parse_args(argv: list[str] | None = None) -> Config:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--main-task-name", required=True)
     parser.add_argument("--main-task-path", type=normalize_task_path, default="\\")
     parser.add_argument("--tunnel-client", type=Path, required=True)
+    parser.add_argument("--tunnel-client-sha256", type=sha256_value, required=True)
     parser.add_argument("--health-url-file", type=Path, required=True)
     parser.add_argument("--pid-file", type=Path, required=True)
     parser.add_argument("--tunnel-log", type=Path)
@@ -700,6 +895,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--backend-url", required=True)
     parser.add_argument("--backend-workspace", required=True)
     parser.add_argument("--backend-required-tool", action="append", default=[])
+    parser.add_argument("--expected-tool-catalog-sha256", type=sha256_value)
+    parser.add_argument("--backend-authorization-header-file", type=Path)
+    parser.add_argument("--main-task-arguments-sha256", type=sha256_value)
     parser.add_argument(
         "--recovery-backoff-seconds",
         type=parse_backoff,
@@ -709,12 +907,16 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--event-log-max-bytes", type=int, default=5 * 1024 * 1024)
     parser.add_argument("--event-log-backups", type=int, default=3)
     parser.add_argument("--stable-health-seconds", type=float, default=300.0)
+    parser.add_argument("--loop-interval-seconds", type=float, default=0.0)
     args = parser.parse_args(argv)
     if args.failure_threshold < 1:
         parser.error("--failure-threshold must be at least 1")
+    if args.loop_interval_seconds != 0 and args.loop_interval_seconds < 5:
+        parser.error("--loop-interval-seconds must be zero or at least 5")
     return Config(
         main_task_name=args.main_task_name,
         tunnel_client=args.tunnel_client.resolve(),
+        tunnel_client_sha256=args.tunnel_client_sha256,
         health_url_file=args.health_url_file.resolve(),
         pid_file=args.pid_file.resolve(),
         tunnel_log=args.tunnel_log.resolve() if args.tunnel_log is not None else None,
@@ -727,28 +929,30 @@ def parse_args(argv: list[str] | None = None) -> Config:
         backend_url=args.backend_url,
         backend_workspace=args.backend_workspace,
         backend_required_tools=tuple(args.backend_required_tool),
+        backend_authorization_header_file=(
+            args.backend_authorization_header_file.resolve()
+            if args.backend_authorization_header_file is not None
+            else None
+        ),
         main_task_path=args.main_task_path,
         recovery_backoff_seconds=args.recovery_backoff_seconds,
         stable_health_seconds=max(0.0, args.stable_health_seconds),
         event_log_max_bytes=max(1024, args.event_log_max_bytes),
         event_log_backups=max(1, args.event_log_backups),
+        loop_interval_seconds=max(0.0, args.loop_interval_seconds),
+        main_task_arguments_sha256=args.main_task_arguments_sha256,
+        expected_tool_catalog_sha256=args.expected_tool_catalog_sha256,
     )
 
 
 def main(argv: list[str] | None = None) -> int:
     config = parse_args(argv)
+    if config.loop_interval_seconds > 0:
+        return run_loop(config, interval_seconds=config.loop_interval_seconds)
     try:
         return run_once(config)
     except Exception as exc:  # noqa: BLE001 - scheduled task must leave durable evidence
-        append_event(
-            config.event_log,
-            max_bytes=config.event_log_max_bytes,
-            backups=config.event_log_backups,
-            action="watchdog_error",
-            error_type=type(exc).__name__,
-        )
-        if sys.stderr is not None:
-            print(f"Secure MCP Tunnel watchdog failed: {exc}", file=sys.stderr)
+        record_watchdog_error(config, exc)
         return 1
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import io
 import unittest
 import urllib.error
@@ -57,6 +58,16 @@ class McpBackendProbeTests(unittest.TestCase):
         self.assertEqual(result.cause_type, "TimeoutError")
         self.assertEqual(result.cause_message, "connection timed out")
 
+    def test_incomplete_http_response_is_structured_and_retryable(self) -> None:
+        failure = http.client.IncompleteRead(b"partial", 10)
+        with patch.object(probe_module.urllib.request, "urlopen", side_effect=failure):
+            result = self.probe()
+
+        self.assertEqual(result.category, "transport")
+        self.assertEqual(result.phase, "connect")
+        self.assertEqual(result.cause_type, "IncompleteRead")
+        self.assertIs(result.retryable, True)
+
     def test_wrong_workspace_is_explicit_identity_failure(self) -> None:
         with TemporaryDirectory() as temporary:
             expected = Path(temporary) / "expected"
@@ -81,6 +92,51 @@ class McpBackendProbeTests(unittest.TestCase):
         self.assertEqual(result.category, "identity")
         self.assertEqual(result.backend_state, "wrong_workspace")
         self.assertIs(result.retryable, False)
+
+    def test_post_forwards_configured_authorization_header(self) -> None:
+        class Response:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def getcode(self) -> int:
+                return 204
+
+            def read(self) -> bytes:
+                return b""
+
+        def open_request(request, *, timeout):
+            self.assertEqual(request.get_header("Authorization"), "Bearer test-secret-value")
+            self.assertEqual(timeout, 1)
+            return Response()
+
+        with patch.object(probe_module.urllib.request, "urlopen", side_effect=open_request):
+            result = probe_module._post(
+                "http://127.0.0.1:18765/mcp",
+                {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+                protocol_version="2025-11-25",
+                timeout=1,
+                expect_reply=False,
+                authorization_header="Bearer test-secret-value",
+            )
+        self.assertIsNone(result)
+
+    def test_authorization_header_file_is_strictly_validated(self) -> None:
+        with TemporaryDirectory() as temporary:
+            header_file = Path(temporary) / "authorization.txt"
+            header_file.write_text("Bearer test-secret-value\n", encoding="utf-8")
+            self.assertEqual(
+                probe_module.load_authorization_header(header_file),
+                "Bearer test-secret-value",
+            )
+            for invalid in ("", "test-secret-value", "Basic dGVzdA==", "Bearer has spaces"):
+                header_file.write_text(invalid, encoding="utf-8")
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    probe_module.load_authorization_header(header_file)
 
 
 if __name__ == "__main__":
