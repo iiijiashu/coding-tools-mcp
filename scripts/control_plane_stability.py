@@ -11,7 +11,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from benchmarks.mcp_http import McpHttpClient
+from benchmarks.mcp_http import McpHttpClient  # noqa: E402
 
 
 def percentile(values: list[float], fraction: float) -> float:
