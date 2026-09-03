@@ -279,6 +279,102 @@ class ControlPlaneTransactionTests(unittest.TestCase):
                         "schema_version": 1,
                         "operation_id": operation_id,
                         "state": "failed",
+                        "error_type": "RuntimeError",
+                        "error": "initial restart failed",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            snapshot = {
+                "status": "READY",
+                "port_owner": {"pid": 200},
+                "runtime_contract": {"actual_config_sha256": "a" * 64},
+                "local_mcp": {"permission_mode": "dangerous"},
+                "tunnel": {"ok": True},
+            }
+
+            def ready_only_while_restart_recovery_is_active() -> dict[str, object]:
+                receipt = json.loads(
+                    (state_root / "receipts" / f"{operation_id}.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(receipt["state"], "running")
+                self.assertTrue(receipt["recovered"])
+                return snapshot
+
+            with (
+                patch("scripts.control_plane_transaction.validate_state_root_security"),
+                patch("scripts.control_plane_transaction._listener_pid", return_value=100),
+                patch("scripts.control_plane_transaction._restart_main_task") as restart,
+                patch(
+                    "scripts.control_plane_transaction._doctor_snapshot",
+                    side_effect=ready_only_while_restart_recovery_is_active,
+                ),
+            ):
+                self.assertEqual(execute_active(state_root), 0)
+            restart.assert_called_once_with()
+            receipt = json.loads(
+                (state_root / "receipts" / f"{operation_id}.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(receipt["state"], "succeeded")
+            self.assertTrue(receipt["recovered"])
+            self.assertEqual(
+                receipt["recovery_previous_failure"],
+                {
+                    "state": "failed",
+                    "error_type": "RuntimeError",
+                    "error": "initial restart failed",
+                },
+            )
+            self.assertFalse((state_root / "active.json").exists())
+            self.assertFalse((state_root / "journals" / f"{operation_id}.json").exists())
+
+    def test_restart_recovery_restarts_when_no_backend_is_listening(self) -> None:
+        with TemporaryDirectory() as temporary:
+            state_root = Path(temporary)
+            operation_id = "d" * 32
+            for name in ("requests", "journals", "receipts"):
+                (state_root / name).mkdir()
+            (state_root / "active.json").write_text(
+                json.dumps({"schema_version": 1, "operation_id": operation_id}),
+                encoding="utf-8",
+            )
+            (state_root / "requests" / f"{operation_id}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "operation_id": operation_id,
+                        "operation": "restart",
+                        "expected_sha256": "a" * 64,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (state_root / "journals" / f"{operation_id}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "operation_id": operation_id,
+                        "operation": "restart",
+                        "phase": "prepared",
+                        "old_backend_pid": 100,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (state_root / "receipts" / f"{operation_id}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "operation_id": operation_id,
+                        "state": "running",
+                        "recovered": True,
+                        "recovery_previous_failure": {
+                            "state": "failed",
+                            "error_type": "RuntimeError",
+                            "error": "original restart failed",
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -292,19 +388,24 @@ class ControlPlaneTransactionTests(unittest.TestCase):
             }
             with (
                 patch("scripts.control_plane_transaction.validate_state_root_security"),
-                patch("scripts.control_plane_transaction._listener_pid", return_value=100),
+                patch("scripts.control_plane_transaction._listener_pid", return_value=None),
                 patch("scripts.control_plane_transaction._restart_main_task") as restart,
-                patch("scripts.control_plane_transaction._doctor_snapshot", return_value=snapshot),
+                patch(
+                    "scripts.control_plane_transaction._doctor_snapshot",
+                    return_value=snapshot,
+                ),
             ):
                 self.assertEqual(execute_active(state_root), 0)
             restart.assert_called_once_with()
             receipt = json.loads(
-                (state_root / "receipts" / f"{operation_id}.json").read_text(encoding="utf-8")
+                (state_root / "receipts" / f"{operation_id}.json").read_text(
+                    encoding="utf-8"
+                )
             )
-            self.assertEqual(receipt["state"], "succeeded")
-            self.assertTrue(receipt["recovered"])
-            self.assertFalse((state_root / "active.json").exists())
-            self.assertFalse((state_root / "journals" / f"{operation_id}.json").exists())
+            self.assertEqual(
+                receipt["recovery_previous_failure"]["error"],
+                "original restart failed",
+            )
 
     def test_update_recovery_reopens_terminal_receipt_before_doctor(self) -> None:
         with TemporaryDirectory() as temporary:

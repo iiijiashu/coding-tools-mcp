@@ -633,22 +633,59 @@ def _recover_journal(state_root: Path, operation_id: str, journal_path: Path) ->
         journal_path.unlink(missing_ok=True)
         return 1
     if operation == "restart":
+        previous_failure: dict[str, object] | None = None
+        receipt_path = state_root / "receipts" / f"{operation_id}.json"
+        if receipt_path.exists():
+            previous_receipt = _load_json(receipt_path)
+            if (
+                previous_receipt.get("schema_version") != 1
+                or previous_receipt.get("operation_id") != operation_id
+            ):
+                raise RuntimeError("restart recovery receipt identity is invalid")
+            preserved_failure = previous_receipt.get("recovery_previous_failure")
+            if isinstance(preserved_failure, dict):
+                previous_failure = {
+                    key: preserved_failure[key]
+                    for key in ("state", "error_type", "error")
+                    if key in preserved_failure
+                }
+            elif previous_receipt.get("state") == "failed":
+                previous_failure = {
+                    key: previous_receipt[key]
+                    for key in ("state", "error_type", "error")
+                    if key in previous_receipt
+                }
+        recovery_fields: dict[str, object] = {
+            "state": "running",
+            "operation": "restart",
+            "recovered": True,
+            "phase": "verification",
+        }
+        if previous_failure:
+            recovery_fields["recovery_previous_failure"] = previous_failure
+        _write_receipt(
+            state_root,
+            operation_id,
+            **recovery_fields,
+        )
         old_pid = journal.get("old_backend_pid")
         current_pid = _listener_pid()
-        if not isinstance(old_pid, int) or current_pid == old_pid:
+        if (
+            not isinstance(old_pid, int)
+            or not isinstance(current_pid, int)
+            or current_pid == old_pid
+        ):
             _restart_main_task()
         snapshot = _doctor_snapshot()
         new_pid = _receipt_summary(snapshot).get("backend_pid")
         if isinstance(old_pid, int) and new_pid == old_pid:
             raise RuntimeError("recovered restart did not replace the backend process")
-        _write_receipt(
-            state_root,
-            operation_id,
+        recovery_fields.update(
             state="succeeded",
-            operation="restart",
-            recovered=True,
             **_receipt_summary(snapshot),
         )
+        recovery_fields.pop("phase", None)
+        _write_receipt(state_root, operation_id, **recovery_fields)
         journal_path.unlink(missing_ok=True)
         return 0
     raise RuntimeError("transaction journal operation is invalid")
@@ -771,12 +808,19 @@ def execute_active(state_root: Path = DEFAULT_STATE_ROOT) -> int:
                 with contextlib.suppress(OSError, ValueError, json.JSONDecodeError):
                     previous = _load_json(receipt_path)
             if previous.get("state") != "rolled_back":
+                failure_fields: dict[str, object] = {
+                    "state": "failed",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+                if isinstance(previous.get("recovery_previous_failure"), dict):
+                    failure_fields["recovery_previous_failure"] = previous[
+                        "recovery_previous_failure"
+                    ]
                 _write_receipt(
                     state_root,
                     operation_id,
-                    state="failed",
-                    error_type=type(exc).__name__,
-                    error=str(exc),
+                    **failure_fields,
                 )
             return 1
         finally:

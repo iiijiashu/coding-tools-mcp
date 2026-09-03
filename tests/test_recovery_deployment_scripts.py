@@ -354,6 +354,27 @@ class RecoveryDeploymentScriptTests(unittest.TestCase):
             msg="canonical deployer can claim rollback without verifying the restored task",
         )
 
+    def test_deployer_waits_for_full_doctor_readiness_after_supervisor_restart(self) -> None:
+        text = (SCRIPTS / "deploy_control_plane_supervisors.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+        self.assertIn("function Wait-ControlPlaneReady", text)
+        self.assertIn("function Invoke-ControlPlaneDoctorBounded", text)
+        self.assertIn("$process.WaitForExit($TimeoutMilliseconds)", text)
+        self.assertIn("$process.Kill($true)", text)
+        self.assertIn("taskkill.exe", text)
+        self.assertIn("-Arguments @('--catalog-snapshot-only')", text)
+        self.assertEqual(text.count("& $doctorPython $doctorScript"), 0)
+        self.assertIn("$deadline = [DateTime]::UtcNow.AddSeconds(120)", text)
+        self.assertIn("$currentDoctor = $null", text)
+        self.assertIn(
+            "$doctorExit -eq 0 -and $currentDoctor -and $currentDoctor.status -eq 'READY'",
+            text,
+        )
+        self.assertNotIn("$doctorExit -eq 0 -and $lastDoctor", text)
+        self.assertIn("$doctor = Wait-ControlPlaneReady", text)
+        self.assertNotIn("Start-Sleep -Seconds 5\n    $doctorOutput", text)
+
 
 if __name__ == "__main__":
     unittest.main()

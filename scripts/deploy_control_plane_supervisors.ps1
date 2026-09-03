@@ -31,22 +31,19 @@ $changed = [System.Collections.Generic.List[string]]::new()
 $backups = @{}
 
 function Get-LiveCatalogSnapshot {
-    $previousErrorAction = $ErrorActionPreference
-    $previousNativePreference = $PSNativeCommandUseErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $PSNativeCommandUseErrorActionPreference = $false
-        $output = & $doctorPython $doctorScript --catalog-snapshot-only 2>&1
-        $doctorExit = $LASTEXITCODE
-    } finally {
-        $PSNativeCommandUseErrorActionPreference = $previousNativePreference
-        $ErrorActionPreference = $previousErrorAction
+    $invocation = Invoke-ControlPlaneDoctorBounded `
+        -TimeoutMilliseconds 30000 -Arguments @('--catalog-snapshot-only')
+    if ($invocation.TimedOut) {
+        throw 'Authenticated live catalog snapshot timed out after 30 seconds'
     }
-    if ($doctorExit -ne 0) {
-        throw "Authenticated live catalog snapshot failed: $($output -join [Environment]::NewLine)"
+    if ($invocation.ExitCode -ne 0) {
+        throw (
+            'Authenticated live catalog snapshot failed: ' +
+            $invocation.StdErr
+        )
     }
     try {
-        $snapshot = ($output -join [Environment]::NewLine) | ConvertFrom-Json
+        $snapshot = $invocation.StdOut | ConvertFrom-Json
     } catch {
         throw "Authenticated live catalog snapshot returned invalid JSON: $($_.Exception.Message)"
     }
@@ -55,6 +52,121 @@ function Get-LiveCatalogSnapshot {
         throw 'Authenticated live catalog snapshot did not satisfy the deployment contract'
     }
     return $snapshot
+}
+
+function Invoke-ControlPlaneDoctorBounded {
+    param(
+        [ValidateRange(1, 120000)]
+        [int] $TimeoutMilliseconds,
+        [string[]] $Arguments = @()
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $doctorPython
+    $allArguments = @($doctorScript) + @($Arguments)
+    if (@($allArguments | Where-Object { $_ -match '"' }).Count -ne 0) {
+        throw 'Control-plane doctor arguments may not contain double quotes'
+    }
+    $startInfo.Arguments = ($allArguments | ForEach-Object { '"' + $_ + '"' }) -join ' '
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw 'Control-plane doctor process did not start'
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $timedOut = -not $process.WaitForExit($TimeoutMilliseconds)
+        if ($timedOut) {
+            try {
+                $process.Kill($true)
+            } catch {
+                if (-not $process.HasExited) {
+                    $taskkillPath = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+                    $taskkillOutput = & $taskkillPath /PID $process.Id /T /F 2>&1
+                    if ($LASTEXITCODE -ne 0 -and -not $process.HasExited) {
+                        throw (
+                            "Timed-out control-plane doctor tree could not be terminated: " +
+                            ($taskkillOutput -join [Environment]::NewLine)
+                        )
+                    }
+                }
+            }
+            if (-not $process.WaitForExit(5000)) {
+                throw 'Timed-out control-plane doctor tree did not terminate within 5 seconds'
+            }
+        }
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        return [pscustomobject]@{
+            TimedOut = $timedOut
+            ExitCode = $(if ($timedOut) { $null } else { $process.ExitCode })
+            StdOut = $stdout
+            StdErr = $stderr
+        }
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Wait-ControlPlaneReady {
+    $deadline = [DateTime]::UtcNow.AddSeconds(120)
+    $lastDoctor = $null
+    $lastParseError = $null
+    do {
+        $remainingMilliseconds = [int] [Math]::Max(
+            1,
+            [Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+        )
+        $doctorInvocation = Invoke-ControlPlaneDoctorBounded `
+            -TimeoutMilliseconds ([Math]::Min(30000, $remainingMilliseconds))
+        $currentDoctor = $null
+        if ($doctorInvocation.TimedOut) {
+            $doctorExit = $null
+            $lastParseError = 'Timeout'
+        } else {
+            $doctorExit = $doctorInvocation.ExitCode
+            try {
+                $currentDoctor = $doctorInvocation.StdOut | ConvertFrom-Json
+                $lastDoctor = $currentDoctor
+                $lastParseError = $null
+            } catch {
+                $lastParseError = $_.Exception.GetType().Name
+            }
+        }
+        if ($doctorExit -eq 0 -and $currentDoctor -and $currentDoctor.status -eq 'READY') {
+            return $currentDoctor
+        }
+        if ([DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Seconds 2
+        }
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    $status = if ($lastDoctor) { [string] $lastDoctor.status } else { 'UNAVAILABLE' }
+    $leaseReason = if ($lastDoctor -and $lastDoctor.control_plane) {
+        [string] $lastDoctor.control_plane.lease_reason
+    } else {
+        'unknown'
+    }
+    $violations = if ($lastDoctor -and $lastDoctor.task_contract) {
+        @($lastDoctor.task_contract.violations) -join ','
+    } else {
+        ''
+    }
+    $tunnelOk = if ($lastDoctor -and $lastDoctor.tunnel) {
+        [string] $lastDoctor.tunnel.ok
+    } else {
+        'unknown'
+    }
+    throw (
+        "Doctor did not become READY within 120 seconds: status=$status; " +
+        "control_plane=$leaseReason; task_contract=$violations; " +
+        "tunnel_ok=$tunnelOk; parse_error=$lastParseError"
+    )
 }
 
 $deploymentMutex = Enter-ControlPlaneDeploymentMutex
@@ -415,13 +527,7 @@ try {
     $approvedTunnel = Assert-ApprovedTunnelContract
     $approvedTunnelExecutable = [string] $approvedTunnel.Executable
     foreach ($spec in $specs) { Update-Supervisor -Spec $spec }
-    Start-Sleep -Seconds 5
-    $doctorOutput = & $doctorPython $doctorScript 2>&1
-    $doctorExit = $LASTEXITCODE
-    $doctor = $doctorOutput | ConvertFrom-Json
-    if ($doctorExit -ne 0 -or $doctor.status -ne 'READY') {
-        throw "Doctor rejected supervisor deployment: $($doctor.task_contract.violations -join ',')"
-    }
+    $doctor = Wait-ControlPlaneReady
     Write-Journal -State 'committed'
     [pscustomobject]@{
         status = 'committed'
