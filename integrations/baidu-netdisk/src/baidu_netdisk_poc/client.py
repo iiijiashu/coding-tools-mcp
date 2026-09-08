@@ -71,7 +71,12 @@ class BaiduNetdiskClient:
         if max_retries < 1:
             raise ValueError("max_retries must be >= 1")
         self.access_token = access_token
-        self.session = session or requests.Session()
+        if session is None:
+            session = requests.Session()
+            # Keep Baidu's data plane off HTTP(S)_PROXY by default. OS-level TUN
+            # routing still applies, so Clash should also keep the Baidu hosts DIRECT.
+            session.trust_env = False
+        self.session = session
         self.chunk_size = chunk_size
         self.timeout = timeout
         self.max_retries = max_retries
@@ -282,14 +287,27 @@ class BaiduNetdiskClient:
                 return payload
             except BaiduNetdiskError:
                 raise
-            except (requests.RequestException, ValueError) as exc:
+            except requests.RequestException as exc:
                 last_error = exc
-                if attempt + 1 >= self.max_retries:
+                if attempt + 1 >= self.max_retries or not self._is_retryable(exc):
                     break
                 time.sleep(self.retry_backoff * (2**attempt))
+            except ValueError as exc:
+                # Malformed JSON is not improved by resending file bytes.
+                last_error = exc
+                break
 
         safe = self._redact(str(last_error) if last_error else "unknown transport error")
         raise BaiduNetdiskError(f"{operation} request failed: {safe}")
+
+    @staticmethod
+    def _is_retryable(exc: requests.RequestException) -> bool:
+        if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+            return True
+        if isinstance(exc, requests.HTTPError):
+            status = exc.response.status_code if exc.response is not None else None
+            return status == 429 or (status is not None and 500 <= status < 600)
+        return False
 
     def _redact(self, text: str) -> str:
         if self.access_token:
