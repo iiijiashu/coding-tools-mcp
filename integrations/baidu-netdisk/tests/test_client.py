@@ -129,3 +129,32 @@ def test_invalid_missing_part_index_is_rejected(tmp_path: Path) -> None:
     client = BaiduNetdiskClient("secret", session=session, chunk_size=4)
     with pytest.raises(BaiduNetdiskError, match="out-of-range"):
         client.upload_file(local)
+
+
+def test_default_session_ignores_proxy_environment() -> None:
+    client = BaiduNetdiskClient("secret")
+    assert client.session.trust_env is False
+
+
+def test_http_401_is_not_retried(tmp_path: Path) -> None:
+    local = tmp_path / "x.txt"
+    local.write_text("x", encoding="utf-8")
+
+    class AuthFailureSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def post(self, url: str, **kwargs):
+            self.calls += 1
+            response = requests.Response()
+            response.status_code = 401
+            response.url = f"{url}?access_token=secret"
+            raise requests.HTTPError("401 unauthorized", response=response)
+
+    session = AuthFailureSession()
+    client = BaiduNetdiskClient(
+        "secret", session=session, max_retries=3, retry_backoff=0
+    )
+    with pytest.raises(BaiduNetdiskError):
+        client.upload_file(local)
+    assert session.calls == 1
