@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "baidu-netdisk-low-traffic-poc"
+version = "0.1.0"
+description = "Direct-to-Baidu Netdisk MCP upload POC with bounded memory and missing-part upload."
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=2.0,<3",
+  "requests>=2.32,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+baidu-netdisk-low-traffic = "baidu_netdisk_poc.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
