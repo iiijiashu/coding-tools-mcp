@@ -2,11 +2,44 @@ from __future__ import annotations
 
 import locale
 import os
+import codecs
 from dataclasses import dataclass
 from typing import Any
 
 
 DEFAULT_MAX_LINES = 2000
+
+
+def output_page_bytes(data: bytes, start: int, limit: int, *, final: bool) -> tuple[bytes, str]:
+    """Keep byte cursors while returning whole characters, including tiny pages."""
+    encoding = "utf-8"
+    # Retention may cut the first character. Inspect the remaining UTF-8
+    # bytes so one lost prefix does not corrupt every subsequent page.
+    leading = 0
+    while leading < min(3, len(data)) and 0x80 <= data[leading] <= 0xBF:
+        leading += 1
+    try:
+        codecs.getincrementaldecoder(encoding)(errors="strict").decode(data[leading:], final=False)
+    except UnicodeDecodeError:
+        if os.name == "nt":
+            encoding = locale.getpreferredencoding(False)
+        try:
+            codecs.getincrementaldecoder(encoding)(errors="strict").decode(data, final=False)
+        except (UnicodeDecodeError, LookupError):
+            return data[start:start + limit], "unknown"
+    end = min(len(data), start + limit)
+    while True:
+        decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+        decoder.decode(data[start:end], final=False)
+        pending = len(decoder.getstate()[0])
+        if not pending:
+            return data[start:end], encoding
+        complete_end = end - pending
+        if complete_end > start:
+            return data[start:complete_end], encoding
+        if end == len(data):
+            return (data[start:end] if final else b""), encoding
+        end += 1
 
 
 def decode_output_bytes(data: bytes) -> str:

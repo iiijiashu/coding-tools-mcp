@@ -18,6 +18,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -90,7 +91,8 @@ from .protocol import (
 )
 from .project_context import ProjectContext, load_project_context
 from .telemetry import SessionTelemetry
-from .textutils import DEFAULT_MAX_LINES, TextTruncation, decode_output_bytes, truncate_text_head
+from .stdin_writer import MAX_STDIN_WRITE_BYTES
+from .textutils import DEFAULT_MAX_LINES, TextTruncation, decode_output_bytes, output_page_bytes, truncate_text_head
 from .tool_results import make_tool_result
 from .transport_stdio import serve_stdio
 
@@ -268,7 +270,7 @@ class HTTPInstanceLease:
         if os.name == "nt":
             import msvcrt
 
-            msvcrt.locking(self._stream.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(self._stream.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
         else:
             import fcntl
 
@@ -280,7 +282,7 @@ class HTTPInstanceLease:
         if os.name == "nt":
             import msvcrt
 
-            msvcrt.locking(self._stream.fileno(), msvcrt.LK_UNLCK, 1)
+            msvcrt.locking(self._stream.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
         else:
             import fcntl
 
@@ -830,6 +832,7 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         description=(
             "Run a bounded command under runtime policy. Pass workdir explicitly for reconnect-safe paths. "
             "Set interactive=true to keep a pipe-backed stdin open when tty is unavailable. "
+            "Set background=true only for an explicitly requested persistent service; it survives runtime close, logs to files, and has no automatic timeout. "
             "A still-running command returns command_id. Example: "
             "{\"cmd\":\"pytest -q\",\"workdir\":\".\",\"yield_time_ms\":30000}. "
             "Retained output is bounded per stream; for very large output redirect to a file "
@@ -1446,7 +1449,7 @@ class Workspace:
     @staticmethod
     def _windows_drive_type(root: str) -> int:
         try:
-            get_drive_type = ctypes.windll.kernel32.GetDriveTypeW
+            get_drive_type = ctypes.windll.kernel32.GetDriveTypeW  # type: ignore[attr-defined]
             get_drive_type.argtypes = [ctypes.c_wchar_p]
             get_drive_type.restype = ctypes.c_uint
             return int(get_drive_type(root))
@@ -1549,6 +1552,7 @@ class Workspace:
         return ResolvedPath(self.display_read_path(resolved), resolved, True)
 
     def resolve_for_write(self, raw_path: str) -> ResolvedPath:
+        display: Callable[[Path], str]
         absolute = self._is_absolute_path(raw_path)
         if absolute and self.allow_any_local_path:
             candidate = self._unrestricted_absolute_candidate(raw_path)
@@ -1557,8 +1561,9 @@ class Workspace:
             pure = self._reject_unsafe_text(raw_path)
             candidate = self.root.joinpath(*pure.parts)
 
-            def display(path: Path) -> str:
+            def relative_display(path: Path) -> str:
                 return normalize_rel_display(path, self.root)
+            display = relative_display
         if candidate.name in {"", ".", ".."}:
             raise ToolFailure("INVALID_ARGUMENT", "Invalid write target.", category="validation")
         if candidate.exists() or candidate.is_symlink():
@@ -1706,15 +1711,19 @@ class WorkspaceCommandManager:
             commands.extend(self.output_commands.values())
             self.commands.clear()
             self.output_commands.clear()
+        keep_runtime_dirs = any(command.background and not command._group_cleaned for command in commands)
         for command in commands:
+            if command.background:
+                command.release_background()
+                continue
             command.close_stdin()
             command.refresh_status()
-            if command.process.poll() is None:
-                terminate_process_group(command.process, signal.SIGTERM)
+            command.terminate(signal.SIGTERM)
             command.drain_readers()
-        shutil.rmtree(self.runtime_dir, ignore_errors=True)
-        if self.fallback_runtime_dir is not None:
-            shutil.rmtree(self.fallback_runtime_dir, ignore_errors=True)
+        if not keep_runtime_dirs:
+            shutil.rmtree(self.runtime_dir, ignore_errors=True)
+            if self.fallback_runtime_dir is not None:
+                shutil.rmtree(self.fallback_runtime_dir, ignore_errors=True)
 
 
 class Runtime:
@@ -1829,6 +1838,7 @@ class Runtime:
         self.patch_lock = threading.Lock()
         self.patch_committer = AtomicPatchCommitter()
         self.mutation_receipt_lock = threading.Lock()
+        self.mutation_receipt_health: dict[str, Any] = {"status": "unknown", "failures": 0}
         # ProjectContext is frozen and derived only from the workspace tree, so
         # an embedder that builds several runtimes over one workspace can reuse
         # the discovery (git ls-files / directory walk) result.
@@ -2096,7 +2106,7 @@ class Runtime:
         tool: str,
         args_hash: str,
         payload: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Append a bounded receipt without ever making the tool itself fail."""
         path = self._mutation_receipt_file()
         event: dict[str, Any] = {
@@ -2140,10 +2150,21 @@ class Runtime:
                     stream.write(json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n")
                     stream.flush()
                     os.fsync(stream.fileno())
-        except OSError:
-            # Evidence must be best effort; a full/read-only disk cannot turn a
-            # valid user operation into an unrelated MCP failure.
-            return
+                self.mutation_receipt_health.update(status="healthy", storage_error=None)
+            return {"persisted": True}
+        except OSError as exc:
+            error = {"type": type(exc).__name__, "errno": exc.errno}
+            with self.mutation_receipt_lock:
+                self.mutation_receipt_health.update(status="degraded", storage_error=error)
+                self.mutation_receipt_health["failures"] += 1
+            return {"persisted": False, "storage_error": error}
+
+    def _finish_mutation_receipt(self, receipt_id: str, receipt_hash: str, name: str, payload: dict[str, Any], started: dict[str, Any]) -> None:
+        finished = self._append_mutation_receipt(receipt_id=receipt_id, phase="finished", tool=name, args_hash=receipt_hash, payload=payload)
+        receipt = {"receipt_id": receipt_id, "args_sha256": receipt_hash, "path": str(self._mutation_receipt_file()), "started_persisted": started["persisted"], "finished_persisted": finished["persisted"], "persisted": started["persisted"] and finished["persisted"]}
+        if not receipt["persisted"]:
+            receipt["storage_error"] = finished.get("storage_error") or started.get("storage_error")
+        payload["mutation_receipt"] = receipt
 
     def _landlock_enforced(self, landlock: dict[str, Any]) -> bool:
         return bool(landlock.get("available")) and self.landlock_enabled()
@@ -2162,6 +2183,7 @@ class Runtime:
             "server": SERVER_NAME,
             "title": SERVER_TITLE,
             "version": __version__,
+            "mutation_receipt_health": dict(self.mutation_receipt_health),
             "server_instance_id": self.server_instance_id,
             "started_at": self.started_at,
             "pid": os.getpid(),
@@ -2222,10 +2244,11 @@ class Runtime:
         validate_arguments(name, args)
         receipt_id: str | None = None
         receipt_hash: str | None = None
-        if name in MUTATING_TOOL_NAMES:
+        receipt_started: dict[str, Any] = {"persisted": False}
+        if name in MUTATING_TOOL_NAMES and not (name == "write_stdin" and not args.get("chars")):
             receipt_id = secrets.token_urlsafe(12)
             receipt_hash = self._mutation_args_hash(name, args)
-            self._append_mutation_receipt(
+            receipt_started = self._append_mutation_receipt(
                 receipt_id=receipt_id,
                 phase="started",
                 tool=name,
@@ -2235,18 +2258,7 @@ class Runtime:
             payload = handler(args)
             payload.setdefault("ok", True)
             if receipt_id is not None and receipt_hash is not None:
-                payload["mutation_receipt"] = {
-                    "receipt_id": receipt_id,
-                    "args_sha256": receipt_hash,
-                    "path": str(self._mutation_receipt_file()),
-                }
-                self._append_mutation_receipt(
-                    receipt_id=receipt_id,
-                    phase="finished",
-                    tool=name,
-                    args_hash=receipt_hash,
-                    payload=payload,
-                )
+                self._finish_mutation_receipt(receipt_id, receipt_hash, name, payload, receipt_started)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             content = spec.content_builder(payload) if spec.content_builder else None
             return make_tool_result(name, payload, is_error=payload.get("ok") is False, content=content)
@@ -2277,18 +2289,7 @@ class Runtime:
             if exc.code == "ELICITATION_UNSUPPORTED":
                 payload["status"] = "unsupported"
             if receipt_id is not None and receipt_hash is not None:
-                payload["mutation_receipt"] = {
-                    "receipt_id": receipt_id,
-                    "args_sha256": receipt_hash,
-                    "path": str(self._mutation_receipt_file()),
-                }
-                self._append_mutation_receipt(
-                    receipt_id=receipt_id,
-                    phase="finished",
-                    tool=name,
-                    args_hash=receipt_hash,
-                    payload=payload,
-                )
+                self._finish_mutation_receipt(receipt_id, receipt_hash, name, payload, receipt_started)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
         except Exception as exc:  # noqa: BLE001 - tool failures must stay structured
@@ -2305,18 +2306,7 @@ class Runtime:
             if spec.error_status:
                 payload["status"] = spec.error_status
             if receipt_id is not None and receipt_hash is not None:
-                payload["mutation_receipt"] = {
-                    "receipt_id": receipt_id,
-                    "args_sha256": receipt_hash,
-                    "path": str(self._mutation_receipt_file()),
-                }
-                self._append_mutation_receipt(
-                    receipt_id=receipt_id,
-                    phase="finished",
-                    tool=name,
-                    args_hash=receipt_hash,
-                    payload=payload,
-                )
+                self._finish_mutation_receipt(receipt_id, receipt_hash, name, payload, receipt_started)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
 
@@ -3090,10 +3080,19 @@ class Runtime:
         max_output_bytes = int(args.get("max_output_bytes", 65536))
         tty = bool(args.get("tty", False))
         interactive = bool(args.get("interactive", False))
+        background = bool(args.get("background", False))
         stdin_text = str(args.get("stdin", ""))
+        if background and (tty or interactive or stdin_text):
+            raise ToolFailure("INVALID_ARGUMENT", "background=true uses file logs and closed stdin; omit tty, interactive and stdin.", category="validation")
+        stdin_data = stdin_text.encode("utf-8")
+        if len(stdin_data) > MAX_STDIN_WRITE_BYTES:
+            raise ToolFailure(
+                "STDIN_TOO_LARGE", "Input exceeds the per-write byte limit.",
+                category="validation", details={"max_bytes": MAX_STDIN_WRITE_BYTES},
+            )
         env = self._command_env(args.get("env", {}))
         start = time.time()
-        deadline = start + (timeout_ms / 1000.0)
+        deadline = float("inf") if background else start + (timeout_ms / 1000.0)
         landlock_fd: int | None = None
         landlock_warning: str | None = None
         popen_cmd: Any = cmd
@@ -3133,7 +3132,12 @@ class Runtime:
         command: CommandRun | None = None
         registered = False
         slot_released = False
+        log_paths: dict[str, Path] | None = None
         try:
+            if background:
+                log_dir = self.workspace.resolve_for_write(f".coding-tools-mcp/services/{secrets.token_urlsafe(18)}/manifest.json").path.parent
+                log_dir.mkdir(parents=True, exist_ok=False)
+                log_paths = {stream: log_dir / f"{stream}.log" for stream in ("stdout", "stderr")}
             process, pty_master_fd = spawn_process(
                 popen_cmd,
                 cwd=str(workdir.path),
@@ -3141,6 +3145,7 @@ class Runtime:
                 env=env,
                 tty=tty,
                 popen_kwargs=popen_extra,
+                **({"log_paths": log_paths} if background else {}),
             )
             sync_wait_warning = None
             if yield_ms < requested_yield_ms:
@@ -3151,10 +3156,16 @@ class Runtime:
             command_warnings = [warning for warning in (landlock_warning, sync_wait_warning) if warning]
             command = self._make_command(
                 process,
-                timeout_at=deadline,
+                timeout_at=None if background else deadline,
                 warnings=command_warnings or None,
                 pty_master_fd=pty_master_fd,
             )
+            command.background = background
+            command.log_paths = log_paths
+            if log_paths is not None:
+                manifest = {"command_id": command.command_id, "pid": process.pid, "started_at": command.started_at,
+                            "log_paths": {name: str(path) for name, path in log_paths.items()}}
+                (log_paths["stdout"].parent / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
             with self.commands_lock:
                 self.starting_commands -= 1
                 slot_released = True
@@ -3167,8 +3178,11 @@ class Runtime:
             with self.commands_lock:
                 if not registered and not slot_released:
                     self.starting_commands -= 1
-            if process is not None and process.poll() is None:
-                terminate_process_group(process, signal.SIGTERM)
+            if process is not None:
+                if command is not None:
+                    command.terminate(HARD_KILL_SIGNAL, force=True)
+                else:
+                    terminate_process_group(process, HARD_KILL_SIGNAL, force=True)
             raise
         finally:
             if landlock_fd is not None:
@@ -3181,9 +3195,11 @@ class Runtime:
         start_command_watchdog(command)
         try:
             if stdin_text:
-                command.write_input(stdin_text.encode("utf-8"))
-        except ToolFailure:
+                command.write_input(stdin_data)
+        except ToolFailure as exc:
             if process.poll() is None:
+                exc.details["command_id"] = command.command_id
+                exc.details["retry_hint"] = "The command has started; poll its command_id before deciding how to continue."
                 raise
         finally:
             if not tty and not interactive:
@@ -3206,16 +3222,16 @@ class Runtime:
             now = time.time()
             if not tty and now >= deadline:
                 command.timed_out = True
-                terminate_process_group(process, signal.SIGTERM)
+                command.terminate(signal.SIGTERM)
                 command.refresh_status()
                 command.drain_readers()
                 return finish()
             with command.lock:
                 tty_has_initial_output = bool(
-                    len(command.stdout) > command.stdout_cursor
-                    or len(command.stderr) > command.stderr_cursor
+                    command.stdout_total_bytes > command.stdout_cursor
+                    or command.stderr_total_bytes > command.stderr_cursor
                 )
-            if now - start >= initial_wait or (tty and tty_has_initial_output):
+            if background or now - start >= initial_wait or (tty and tty_has_initial_output):
                 return finish()
             time.sleep(0.02)
 
@@ -3557,8 +3573,10 @@ class Runtime:
                     "current_server_instance_id": self.server_instance_id,
                     "command_server_instance_id": command_instance_id,
                     "retry_hint": (
-                        "The old process state was released when the backend restarted. "
-                        "Start the work again with exec_command and use its new command_id."
+                        "Command handles reset when the backend restarts. "
+                        "Explicit background services can still be running: inspect their PID/log records "
+                        "under .coding-tools-mcp/services/ before starting another instance. "
+                        "For an ordinary completed command, start new work with exec_command."
                     ),
                 },
             )
@@ -3573,7 +3591,7 @@ class Runtime:
                 "arguments": {
                     "command_id": command.command_id,
                     "chars": "",
-                    "yield_time_ms": self._bounded_sync_wait_ms(10000),
+                    "yield_time_ms": 0 if command.background else self._bounded_sync_wait_ms(10000),
                 },
             }
         output_refs = {
@@ -3713,13 +3731,13 @@ class Runtime:
         if requested_offset >= tail_start_offset:
             offset = requested_offset
             buffer_offset = offset - tail_start_offset
-            chunk = tail[buffer_offset : buffer_offset + limit]
+            chunk, encoding = output_page_bytes(tail, buffer_offset, limit, final=command.closed)
         elif requested_offset < head_len:
             offset = requested_offset
-            chunk = head[offset : min(head_len, offset + limit)]
+            chunk, encoding = output_page_bytes(head, offset, limit, final=True)
         else:
             offset = tail_start_offset
-            chunk = tail[:limit]
+            chunk, encoding = output_page_bytes(tail, 0, limit, final=command.closed)
         next_offset = offset + len(chunk) if offset + len(chunk) < total_stream_bytes else None
         omitted_bytes = offset - requested_offset
         warnings: list[str] = []
@@ -3739,7 +3757,9 @@ class Runtime:
             "offset": offset,
             "requested_offset": requested_offset,
             "limit": limit,
-            "content": decode_output_bytes(chunk),
+            "content": chunk.decode(encoding, errors="replace") if encoding != "unknown" else decode_output_bytes(chunk),
+            "encoding": encoding,
+            "pending_output": not chunk and offset < total_stream_bytes and not command.closed,
             "next_offset": next_offset,
             "total_retained_bytes": len(tail) + min(head_len, tail_start_offset),
             "head_retained_bytes": head_len,
@@ -3774,19 +3794,22 @@ class Runtime:
             command.write_input(chars.encode("utf-8"))
         requested_yield_ms = int(args.get("yield_time_ms", 10000))
         yield_ms = self._bounded_sync_wait_ms(requested_yield_ms)
-        wait_until = time.time() + (yield_ms / 1000.0)
+        wait_until = time.monotonic() + (yield_ms / 1000.0)
         first_output_at: float | None = None
-        while time.time() < wait_until and command.process.poll() is None:
-            time.sleep(0.02)
-            with command.lock:
-                has_new_output = len(command.stdout) > command.stdout_cursor or len(command.stderr) > command.stderr_cursor
+        while time.monotonic() < wait_until and command.process.poll() is None:
+            command._sync_logs()
+            with command.output_changed:
+                has_new_output = command.stdout_total_bytes > command.stdout_cursor or command.stderr_total_bytes > command.stderr_cursor
                 if has_new_output and not chars:
                     break
                 if has_new_output and chars:
                     if first_output_at is None:
-                        first_output_at = time.time()
-                    if time.time() - first_output_at >= 0.05:
+                        first_output_at = time.monotonic()
+                    if time.monotonic() - first_output_at >= 0.05:
                         break
+                remaining = wait_until - time.monotonic()
+                coalesce = .05 if first_output_at is not None else .25
+                command.output_changed.wait(timeout=max(0, min(remaining, coalesce)))
         payload = command.snapshot_since_cursor(int(args.get("max_output_bytes", 65536)))
         if yield_ms < requested_yield_ms:
             warnings = list(payload.get("warnings", []))
@@ -3815,13 +3838,13 @@ class Runtime:
             signal.SIGTERM,
         )
         evict = True
-        if command.process.poll() is None:
+        if command.process.poll() is None or not command._group_cleaned:
             command.terminating = True
-            terminate_process_group(command.process, signum, force=force)
+            command.terminate(signum, force=force)
             exited = self._wait_for_command_exit(command, int(args.get("wait_ms", 5000)) / 1000.0)
             if not exited and not force:
                 force = True
-                terminate_process_group(command.process, HARD_KILL_SIGNAL, force=True)
+                command.terminate(HARD_KILL_SIGNAL, force=True)
                 exited = self._wait_for_command_exit(command, int(args.get("kill_wait_ms", 2000)) / 1000.0)
             if exited:
                 killed = True
@@ -5671,6 +5694,11 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                     "default": False,
                     "description": "Keep pipe-backed stdin open for later write_stdin calls; useful where tty is unavailable.",
                 },
+                "background": {
+                    **boolean,
+                    "default": False,
+                    "description": "Explicit persistent service: file logs, closed stdin, no automatic timeout, and survives runtime close. Stop explicitly with kill_command.",
+                },
                 "env": {"type": "object", "additionalProperties": {"type": "string"}, "default": {}},
             },
             ["cmd"],
@@ -5942,6 +5970,47 @@ def rpc_response_status(era: str, response: dict[str, Any]) -> int:
 
 class MCPHandler(http.server.BaseHTTPRequestHandler):
     server_version = f"CodingToolsMCP/{__version__}"
+    timeout = 10.0
+
+    def handle_one_request(self) -> None:
+        self._read_expired = False
+        timeout = getattr(self.server, "request_read_timeout", self.timeout)
+
+        def expire() -> None:
+            self._read_expired = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        self._read_timer = threading.Timer(timeout, expire)
+        self._read_timer.daemon = True
+        self._read_timer.start()
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        finally:
+            self._read_timer.cancel()
+
+    def parse_request(self) -> bool:
+        parsed = super().parse_request()
+        if parsed and self.command != "POST":
+            self._read_timer.cancel()
+        return parsed
+
+    def send_response(self, code: int, message: str | None = None) -> None:
+        timer = getattr(self, "_read_timer", None)
+        if timer is not None:
+            timer.cancel()
+        super().send_response(code, message)
+
+    def _read_request_body(self, length: int) -> bytes:
+        body = self.rfile.read(length)
+        self._read_timer.cancel()
+        if self._read_expired or len(body) != length:
+            raise TimeoutError("request body was not completely received before the read deadline")
+        return body
 
     @property
     def runtime(self) -> Runtime:
@@ -6121,7 +6190,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 data={"max_bytes": MAX_HTTP_REQUEST_BYTES},
             )
             return
-        body = self.rfile.read(length)
+        body = self._read_request_body(length)
         try:
             request = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
@@ -6378,7 +6447,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         if not (0 <= length <= OAUTH_MAX_BODY_BYTES):
             self.send_json({"error": "Request body too large"}, status=413)
             return None
-        return self.rfile.read(length)
+        return self._read_request_body(length)
 
     def handle_oauth_authorize_get(self) -> None:
         cfg = self.runtime.oauth_config
@@ -6627,15 +6696,45 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
 
 class RuntimeHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 32
 
     def __init__(
         self,
         address: tuple[str, int],
         handler: type[MCPHandler],
         runtime: Runtime,
+        *,
+        max_active_requests: int = 32,
+        request_read_timeout: float = 10.0,
     ) -> None:
+        if max_active_requests < 1 or request_read_timeout <= 0:
+            raise ValueError("HTTP request limits must be positive")
         self.runtime = runtime
+        self.request_read_timeout = request_read_timeout
+        self._request_slots = threading.BoundedSemaphore(max_active_requests)
         super().__init__(address, handler)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._request_slots.acquire(blocking=False):
+            try:
+                request.settimeout(.1)
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
 
     def server_close(self) -> None:
         self.runtime.close()

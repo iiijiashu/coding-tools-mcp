@@ -30,6 +30,7 @@ The documentation keeps stable file paths for existing links, while this index p
 
 ## Engineering and evaluation
 
+- [PilotDeck-lite control plane](control-plane-pilotdeck-lite.md)
 - [CI and tests](ci-and-tests.md)
 - [Boundary findings](boundary-findings.md)
 - [Competitive analysis](competitive-analysis.md)

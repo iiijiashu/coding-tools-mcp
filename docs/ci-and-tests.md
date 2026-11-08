@@ -11,7 +11,16 @@ make ci
 
 `make compliance` runs the full compliance suite and writes `reports/compliance/latest.json` and `reports/compliance/latest.md`.
 
-`make ci` mirrors the main CI workflow: lint, typecheck, unittest discovery, npm launcher checks, protocol tests, integration/security tests, required docs checks, schema drift checks, dogfood smoke, and SWE-bench smoke preflight. It requires Python 3.11 or newer plus Node.js 18 or newer and npm; GitHub Actions uses Node.js 22.
+`make ci` mirrors the main CI workflow: lint, typecheck, `make test-ci`, launcher checks, the dogfood runner, latency checks, and SWE-bench smoke preflight. `test-ci` discovers every test once, including protocol, integration/security, documentation, and schema checks, and writes the compliance report from that same run. Individual suite commands remain available for focused diagnosis. It requires Python 3.11 or newer plus Node.js 18 or newer and npm; GitHub Actions uses Node.js 22.
+
+The Windows job also exercises stdin delivery, lifecycle guards, HTTP request limits, PilotDeck, and mocked watchdog policy before the MSVC smoke test. Mocked policy tests bypass only the Windows platform guard; native execution still requires Windows.
+
+Windows coverage includes native Job Object ownership, persistent services,
+transaction locks, path rules, and PowerShell recovery scripts. CI caches pip
+downloads and cancels obsolete runs of the same PR/ref. Historical checked-in
+reports are removed before validation, and evidence uploads select only current
+run outputs. Compliance categories distinguish skipped, partial and not-run
+coverage; per-tool results link to tests that actually invoked that tool.
 
 Report files are overwritten by whichever suite or benchmark was run most recently. Check `suite` in compliance reports and `conclusion` in benchmark reports before citing them.
 

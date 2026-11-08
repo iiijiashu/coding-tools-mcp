@@ -37,12 +37,49 @@ class FakeResult:
             )
         ]
         self.skipped = [(FakeTest("tests.compliance.test_e2e.DeterministicE2ETests.test_optional"), "optional")]
+        self.tool_tests = {tool: set(self.test_ids) for tool in REQUIRED_TOOLS}
 
     def wasSuccessful(self) -> bool:
         return self._successful
 
 
 class ComplianceReportTests(unittest.TestCase):
+    def test_tool_statuses_follow_observed_calls_and_subtest_failures(self) -> None:
+        import io
+        from tests.compliance import mcp_client
+
+        class Observed(unittest.TestCase):
+            def test_success(self):
+                mcp_client.tool_call_observer("read_file")
+
+            def test_failure(self):
+                mcp_client.tool_call_observer("write_stdin")
+                with self.subTest(case="delivery"):
+                    self.fail("delivery failed")
+
+        previous = mcp_client.tool_call_observer
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(Observed)
+        result = runner.RecordingRunner(stream=io.StringIO()).run(suite)
+        self.assertIs(mcp_client.tool_call_observer, previous)
+        statuses = runner.required_tool_statuses(suite_name="discovery", result=result, passed=False)
+        self.assertEqual(statuses["read_file"], "passed")
+        self.assertEqual(statuses["write_stdin"], "failed")
+        self.assertEqual(statuses["kill_command"], "not_measured")
+
+    def test_complete_discovery_covers_all_gates_without_duplicate_tests(self) -> None:
+        def identifiers(suite):
+            for item in suite:
+                if isinstance(item, unittest.TestSuite):
+                    yield from identifiers(item)
+                else:
+                    yield item.id()
+
+        discovered = list(identifiers(runner.load_suite("discovery")))
+        required = set(identifiers(runner.load_suite("all")))
+        self.assertEqual(len(discovered), len(set(discovered)))
+        self.assertTrue(required.issubset(set(discovered)))
+        self.assertTrue(any("test_reliability_regressions" in name for name in discovered))
+
     def test_write_reports_records_categories_required_tools_and_failures(self) -> None:
         with tempfile.TemporaryDirectory(prefix="coding-tools-mcp-report-") as tmp:
             report_dir = Path(tmp)

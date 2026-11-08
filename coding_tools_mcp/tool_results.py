@@ -208,7 +208,18 @@ def _render_exec(payload: dict[str, Any]) -> str:
     if len(sections) == 1 and isinstance(summary, str) and summary:
         sections.append(summary)
     command_id = payload.get("command_id")
-    if payload.get("status") == "running" and command_id:
+    if payload.get("background"):
+        sections.append(f"Persistent service PID: {payload.get('pid')}; command_id: {command_id}.")
+        logs = payload.get("log_paths")
+        if isinstance(logs, dict):
+            sections.extend(f"{stream} log: {path}" for stream, path in logs.items())
+        if payload.get("status") == "running":
+            sections.append(
+                "Survives client disconnect and runtime shutdown. "
+                f'Check readiness with write_stdin(command_id="{command_id}", chars="", yield_time_ms=0); '
+                f'stop explicitly with kill_command(command_id="{command_id}").'
+            )
+    elif payload.get("status") == "running" and command_id:
         sections.append(
             f'Command still running; poll with write_stdin(command_id="{command_id}", chars="", yield_time_ms=10000).'
         )

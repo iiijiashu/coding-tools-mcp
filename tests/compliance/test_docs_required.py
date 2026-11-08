@@ -87,14 +87,11 @@ class RequiredDocsTests(unittest.TestCase):
         for needle in (
             "make lint",
             "make typecheck",
-            "make test",
-            "make test-protocol",
-            "make test-integration",
+            "make test-ci",
             "make check-npm-launcher",
-            "make dogfood-smoke",
+            "make dogfood-runner",
             "make benchmark-latency",
             "make benchmark-smoke",
-            "make compliance",
             "actions/upload-artifact",
         ):
             with self.subTest(workflow="compliance", needle=needle):

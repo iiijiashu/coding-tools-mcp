@@ -140,7 +140,10 @@ class ComputerToolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "acceptance.txt"
             target.write_text("", encoding="utf-8")
-            with patch.object(computer_module.os, "startfile", create=True) as startfile:
+            with (
+                patch.object(computer_module, "require_windows"),
+                patch.object(computer_module.os, "startfile", create=True) as startfile,
+            ):
                 result = computer_module.launch_gui(target)
         startfile.assert_called_once_with(str(target), "open", show_cmd=1)
         self.assertEqual(result["argument_count"], 0)
