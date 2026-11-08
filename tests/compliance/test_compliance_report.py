@@ -43,6 +43,20 @@ class FakeResult:
 
 
 class ComplianceReportTests(unittest.TestCase):
+    def test_complete_discovery_covers_all_gates_without_duplicate_tests(self) -> None:
+        def identifiers(suite):
+            for item in suite:
+                if isinstance(item, unittest.TestSuite):
+                    yield from identifiers(item)
+                else:
+                    yield item.id()
+
+        discovered = list(identifiers(runner.load_suite("discovery")))
+        required = set(identifiers(runner.load_suite("all")))
+        self.assertEqual(len(discovered), len(set(discovered)))
+        self.assertTrue(required.issubset(set(discovered)))
+        self.assertTrue(any("test_reliability_regressions" in name for name in discovered))
+
     def test_write_reports_records_categories_required_tools_and_failures(self) -> None:
         with tempfile.TemporaryDirectory(prefix="coding-tools-mcp-report-") as tmp:
             report_dir = Path(tmp)

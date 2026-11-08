@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, BinaryIO
 
 from .errors import ToolFailure
+from .stdin_writer import StdinWriter
 from .textutils import DEFAULT_MAX_LINES, TextTruncation, decode_output_bytes, truncate_text_tail
 
 
@@ -31,7 +32,7 @@ def hidden_process_popen_kwargs() -> dict[str, Any]:
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     if creation_flags:
         kwargs["creationflags"] = creation_flags
-    startupinfo = subprocess.STARTUPINFO()
+    startupinfo = subprocess.STARTUPINFO()  # type: ignore[attr-defined]
     startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
     startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
     kwargs["startupinfo"] = startupinfo
@@ -86,11 +87,7 @@ def terminate_process_group(
                     return
                 except Exception:
                     pass
-        try:
-            process.terminate()
-            process.wait(timeout=1)
-        except Exception:
-            process.kill()
+        _force_terminate_windows_process_tree(process)
         return
     if not hasattr(os, "killpg"):
         try:
@@ -108,13 +105,24 @@ def terminate_process_group(
         return
     except Exception:
         process.terminate()
+    # A reaped parent does not imply that its process group has drained.
+    deadline = time.monotonic() + (0 if force else 1)
+    while time.monotonic() < deadline:
+        process.poll()
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(.02)
+    else:
+        try:
+            os.killpg(process.pid, HARD_KILL_SIGNAL)
+        except ProcessLookupError:
+            pass
     try:
         process.wait(timeout=1)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, HARD_KILL_SIGNAL)
-        except Exception:
-            process.kill()
+        process.kill()
 
 
 def spawn_process(
@@ -207,6 +215,17 @@ class CommandRun:
     pty_master_fd: int | None = None
     on_evict: Any = None
     _stdin_closed: bool = False
+    _stdin_writer: StdinWriter = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._stdin_writer = StdinWriter(self.process, self.pty_master_fd, self._abort_stdin_delivery)
+
+    def _abort_stdin_delivery(self) -> None:
+        try:
+            terminate_process_group(self.process, HARD_KILL_SIGNAL, force=True)
+        finally:
+            if self.process.poll() is None:
+                self.process.kill()
 
     @property
     def head_buffer_limit(self) -> int:
@@ -262,29 +281,14 @@ class CommandRun:
         if lost_bytes:
             self.on_evict(stream, lost_bytes)
 
-    def write_input(self, data: bytes) -> None:
-        if self._stdin_closed:
-            raise ToolFailure("COMMAND_CLOSED", "Command stdin is closed.", category="runtime")
-        try:
-            if self.pty_master_fd is not None:
-                os.write(self.pty_master_fd, data)
-                return
-            if self.process.stdin is None or self.process.stdin.closed:
-                raise ToolFailure("COMMAND_CLOSED", "Command stdin is closed.", category="runtime")
-            self.process.stdin.write(data)
-            self.process.stdin.flush()
-        except (BrokenPipeError, OSError, ValueError) as exc:
-            raise ToolFailure("COMMAND_CLOSED", "Command stdin is closed.", category="runtime") from exc
+    def write_input(self, data: bytes) -> dict[str, Any]:
+        return self._stdin_writer.write(data)
 
     def close_stdin(self) -> None:
         if self.pty_master_fd is not None or self._stdin_closed:
             return
         self._stdin_closed = True
-        if self.process.stdin is not None:
-            try:
-                self.process.stdin.close()
-            except OSError:
-                pass
+        self._stdin_writer.close()
 
     def snapshot_since_cursor(self, max_output_bytes: int) -> dict[str, Any]:
         self.refresh_status()
@@ -309,6 +313,7 @@ class CommandRun:
             status = "running" if self.process.poll() is None else "exited"
         payload: dict[str, Any] = {
             "command_id": self.command_id,
+            "stdin_write": self._stdin_writer.snapshot(),
             "status": status,
             "exit_code": self.exit_code,
             "signal": self.signal_name,

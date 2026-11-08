@@ -20,7 +20,7 @@ def require_windows() -> None:
 
 def _user32() -> Any:
     require_windows()
-    return ctypes.WinDLL("user32", use_last_error=True)
+    return ctypes.WinDLL("user32", use_last_error=True)  # type: ignore[attr-defined]
 
 
 def virtual_screen_metrics() -> dict[str, int]:
@@ -41,7 +41,7 @@ def cursor_position() -> tuple[int, int]:
 
     point = POINT()
     if not user32.GetCursorPos(ctypes.byref(point)):
-        raise OSError(ctypes.get_last_error(), "GetCursorPos failed")
+        raise OSError(ctypes.get_last_error(), "GetCursorPos failed")  # type: ignore[attr-defined]
     return int(point.x), int(point.y)
 
 
@@ -123,7 +123,7 @@ def move_cursor(x: int, y: int) -> None:
     _check_point(x, y)
     user32 = _user32()
     if not user32.SetCursorPos(int(x), int(y)):
-        raise OSError(ctypes.get_last_error(), "SetCursorPos failed")
+        raise OSError(ctypes.get_last_error(), "SetCursorPos failed")  # type: ignore[attr-defined]
 
 
 _BUTTON_FLAGS = {
@@ -276,7 +276,7 @@ def _keyboard_input(*, vk: int = 0, scan: int = 0, flags: int = 0) -> None:
     item.union.ki = KEYBDINPUT(int(vk), int(scan), int(flags), 0, 0)
     sent = int(user32.SendInput(1, ctypes.byref(item), ctypes.sizeof(INPUT)))
     if sent != 1:
-        raise OSError(ctypes.get_last_error(), "SendInput failed")
+        raise OSError(ctypes.get_last_error(), "SendInput failed")  # type: ignore[attr-defined]
 
 
 def _keyboard_event(vk: int, *, key_up: bool = False) -> None:

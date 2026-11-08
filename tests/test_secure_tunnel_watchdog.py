@@ -21,6 +21,9 @@ SPEC.loader.exec_module(watchdog)
 
 class SecureTunnelWatchdogTests(unittest.TestCase):
     def setUp(self) -> None:
+        platform_check = patch.object(watchdog, "require_windows")
+        platform_check.start()
+        self.addCleanup(platform_check.stop)
         self.backend_probe = patch.object(
             watchdog,
             "probe_mcp_backend",

@@ -589,9 +589,13 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def run_once(config: Config) -> int:
+def require_windows() -> None:
     if os.name != "nt":
         raise RuntimeError("the Secure MCP Tunnel watchdog requires Windows")
+
+
+def run_once(config: Config) -> int:
+    require_windows()
     for required in (config.tunnel_client, config.powershell):
         if not required.is_file():
             raise RuntimeError(f"required executable is missing: {required}")

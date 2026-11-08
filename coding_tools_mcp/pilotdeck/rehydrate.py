@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+
+from .recovery import RecoveryBudget
 
 
 class RehydrateBudgetExceeded(ValueError):
-    """Protected state alone cannot fit inside the configured rehydrate budget."""
+    """Protected and actionable state exceed the rehydrate budget."""
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,7 @@ class ProtectedTaskState:
     blockers: tuple[str, ...] = ()
     evidence_refs: tuple[str, ...] = ()
     next_action: str | None = None
+    recovery_budget: RecoveryBudget | None = None
 
     def protected_dict(self) -> dict[str, object]:
         """Return the fields whose values must never be summary-generated."""
@@ -49,6 +52,9 @@ class ProtectedTaskState:
             "stale_results": list(self.stale_results),
             "cleanup_targets": list(self.cleanup_targets),
             "cleanup_receipts": list(self.cleanup_receipts),
+            "recovery_budget": asdict(self.recovery_budget)
+            if self.recovery_budget
+            else None,
         }
 
     def fingerprint(self) -> str:
@@ -65,8 +71,9 @@ def render_rehydrate(state: ProtectedTaskState, *, max_chars: int = 8_192) -> st
     """Render bounded, transcript-free state for a fresh agent context.
 
     Protected identity/acceptance/result/cleanup fields are atomic: if they do
-    not fit, this function raises instead of silently truncating them.  Working
-    sections are appended only while room remains.  Every state value is JSON
+    not fit, this function raises instead of silently truncating them. Blockers,
+    next action and pending work also require space before optional history.
+    Every state value is JSON
     quoted so embedded newlines cannot masquerade as new authoritative fields.
     """
 
@@ -79,14 +86,20 @@ def render_rehydrate(state: ProtectedTaskState, *, max_chars: int = 8_192) -> st
             f"protected state requires {len(protected)} chars but budget is {max_chars}"
         )
 
-    parts = [protected]
-    remaining = max_chars - len(protected)
+    critical = _render_list_section("Blockers", state.blockers)
+    if state.next_action:
+        critical += f"\nNext action:\n- {_quote(state.next_action)}\n"
+    critical += _render_list_section("Pending", state.pending)
+    if len(protected) + len(critical) > max_chars:
+        raise RehydrateBudgetExceeded(
+            "protected state and actionable state exceed the rehydrate budget"
+        )
+    parts = [protected, critical]
+    remaining = max_chars - len(protected) - len(critical)
     optional_sections = (
-        ("Completed", state.completed),
-        ("Verified", state.verified),
-        ("Pending", state.pending),
-        ("Blockers", state.blockers),
         ("Evidence refs", state.evidence_refs),
+        ("Verified", state.verified),
+        ("Completed", state.completed),
     )
     for title, items in optional_sections:
         rendered = _render_list_section(title, items)
@@ -101,15 +114,6 @@ def render_rehydrate(state: ProtectedTaskState, *, max_chars: int = 8_192) -> st
             parts.append(clipped)
             remaining -= len(clipped)
         break
-
-    if state.next_action and remaining > 0:
-        next_section = f"\nNext action:\n- {_quote(state.next_action)}\n"
-        if len(next_section) <= remaining:
-            parts.append(next_section)
-        else:
-            marker = "\nNext action: [omitted: rehydrate budget]\n"
-            if len(marker) <= remaining:
-                parts.append(marker)
 
     return "".join(parts)
 
@@ -129,10 +133,12 @@ def _render_protected(state: ProtectedTaskState) -> str:
     lines.extend(_list_lines("Stale results", state.stale_results))
     lines.extend(_list_lines("Cleanup targets", state.cleanup_targets))
     lines.extend(_list_lines("Cleanup receipts", state.cleanup_receipts))
+    if state.recovery_budget is not None:
+        lines.append(f"Recovery budget: {_quote(asdict(state.recovery_budget))}")
     return "\n".join(lines) + "\n"
 
 
-def _quote(value: str | None) -> str:
+def _quote(value: object) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
@@ -148,7 +154,9 @@ def _list_lines(title: str, items: tuple[str, ...]) -> list[str]:
 def _render_list_section(title: str, items: tuple[str, ...]) -> str:
     if not items:
         return ""
-    return "\n" + "\n".join([f"{title}:", *(f"- {_quote(item)}" for item in items)]) + "\n"
+    return (
+        "\n" + "\n".join([f"{title}:", *(f"- {_quote(item)}" for item in items)]) + "\n"
+    )
 
 
 def _clip_section(title: str, items: tuple[str, ...], remaining: int) -> str:

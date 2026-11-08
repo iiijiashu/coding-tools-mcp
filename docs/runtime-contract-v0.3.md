@@ -294,7 +294,7 @@ Retry: This command_id has expired or never existed; …
 Known tool error codes include:
 
 ```json
-["ABSOLUTE_PATH_DENIED", "BACKEND_RESTARTED", "BINARY_FILE", "COMMAND_CLOSED", "COMMAND_LIMIT_REACHED", "COMMAND_NOT_FOUND", "COMPUTER_UNAVAILABLE", "CONTROL_PLANE_LEASE_REQUIRED", "ELICITATION_UNSUPPORTED", "GIT_ERROR", "INTERNAL_ERROR", "INVALID_ARGUMENT", "IS_DIRECTORY", "NOT_A_DIRECTORY", "NOT_FOUND", "OUTPUT_TOO_LARGE", "PATCH_CONFLICT", "PATCH_CONTEXT_AMBIGUOUS", "PATCH_CONTEXT_NOT_FOUND", "PATCH_FAILED", "PATCH_HUNKS_OVERLAP", "PATCH_ROLLBACK_FAILED", "PATH_OUTSIDE_WORKSPACE", "PERMISSION_REQUIRED", "RUNTIME_DIR_UNWRITABLE", "SANDBOX_UNAVAILABLE", "SYMLINK_ESCAPE", "TTY_UNSUPPORTED", "UNSUPPORTED_ENCODING", "UNSUPPORTED_PLATFORM"]
+["ABSOLUTE_PATH_DENIED", "BACKEND_RESTARTED", "BINARY_FILE", "COMMAND_CLOSED", "COMMAND_LIMIT_REACHED", "COMMAND_NOT_FOUND", "COMPUTER_UNAVAILABLE", "CONTROL_PLANE_LEASE_REQUIRED", "ELICITATION_UNSUPPORTED", "GIT_ERROR", "INTERNAL_ERROR", "INVALID_ARGUMENT", "IS_DIRECTORY", "NOT_A_DIRECTORY", "NOT_FOUND", "OUTPUT_TOO_LARGE", "PATCH_CONFLICT", "PATCH_CONTEXT_AMBIGUOUS", "PATCH_CONTEXT_NOT_FOUND", "PATCH_FAILED", "PATCH_HUNKS_OVERLAP", "PATCH_ROLLBACK_FAILED", "PATH_OUTSIDE_WORKSPACE", "PERMISSION_REQUIRED", "RUNTIME_DIR_UNWRITABLE", "SANDBOX_UNAVAILABLE", "STDIN_BUSY", "STDIN_TOO_LARGE", "SYMLINK_ESCAPE", "TTY_UNSUPPORTED", "UNSUPPORTED_ENCODING", "UNSUPPORTED_PLATFORM"]
 ```
 
 Error categories are `validation`, `security`, `permission`, `runtime`,
@@ -572,3 +572,33 @@ changed for them is the tool catalog and the transport, not the envelope —
 `get_default_cwd` and `set_default_cwd` are gone, relative paths resolve
 against the workspace root, and HTTP no longer has sessions. Every removal, and
 what to do instead, is in [migration-0.3.md](migration-0.3.md).
+
+## Bounded delivery and recovery metadata
+
+Command results include `stdin_write` when input has been submitted. Its
+`write_id`, `accepted_bytes`, `written_bytes`, and `status` (`pending`, `written`,
+or `failed`) describe admission and writes to the OS pipe, not application-level
+consumption. Poll with empty `chars` while delivery is pending; never replay an
+accepted write. `STDIN_BUSY` accepts no additional input. Each write is limited
+to 1 MiB, with one outstanding write per command and at most 32 writers per
+server process. Calls wait at most 50 ms for delivery before returning a receipt.
+A five-second delivery deadline terminates a stalled command and records
+`delivery_timeout`; non-interactive EOF is deferred until admitted input drains.
+
+`read_output` preserves complete UTF-8 or detected Windows locale characters
+across pages. Follow `next_offset` as a byte cursor. A page smaller than one
+character may exceed its byte limit by the bytes needed to finish that character.
+`encoding` names the selected encoding, or `unknown` for undecodable data.
+`pending_output: true` means an incomplete live character needs more bytes; wait
+before retrying the same cursor. Retention gaps continue to report omitted bytes.
+
+`mutation_receipt.persisted` is true only when both start and finish records were
+written and fsynced. `started_persisted`, `finished_persisted`, and `storage_error`
+expose partial failures. `server_info.mutation_receipt_health` reports storage
+status and failure count. A failed receipt write leaves the actual tool result
+intact and explicitly marks the missing durable evidence.
+
+HTTP requests have a ten-second absolute header/body read deadline and at most
+32 active handlers per server. Saturation returns 503 with `Retry-After: 1`.
+The read deadline is cancelled once the complete request is received, before
+tool execution; existing command timeouts still apply.

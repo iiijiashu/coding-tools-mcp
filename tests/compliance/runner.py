@@ -33,6 +33,7 @@ SUITES = {
     "schema-drift": ["tests.compliance.test_schema_drift"],
 }
 SUITES["all"] = [module for name in SUITES for module in SUITES[name]]
+SUITES["discovery"] = []
 
 
 @dataclass
@@ -82,6 +83,8 @@ def make_record(
 
 def load_suite(suite_name: str) -> unittest.TestSuite:
     loader = unittest.defaultTestLoader
+    if suite_name == "discovery":
+        return loader.discover(str(ROOT / "tests"), pattern="test_*.py", top_level_dir=str(ROOT))
     suite = unittest.TestSuite()
     for module in SUITES[suite_name]:
         suite.addTests(loader.loadTestsFromName(module))
@@ -157,7 +160,7 @@ def required_tool_statuses(
 ) -> dict[str, str]:
     if result is None:
         status = "not_run"
-    elif suite_name != "all":
+    elif suite_name not in {"all", "discovery"}:
         status = "not_measured"
     elif passed:
         status = "passed"

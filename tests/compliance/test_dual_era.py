@@ -25,6 +25,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from coding_tools_mcp.server import Runtime
 from tests.compliance.fixtures import FixtureWorkspace, workspace_from_fixture
@@ -577,7 +578,11 @@ class OfficialSDKStdioSmokeTests(unittest.TestCase):
 class OfficialSDKHttpSmokeTests(ComplianceTestCase):
     def test_the_official_sdk_can_drive_the_http_server(self) -> None:
         require_official_sdk(self)
-        assert_sdk_smoke(self, run_sdk_smoke(str(self.client.url)))
+        # The fixture is loopback-only; inherited proxies must not intercept it
+        # or require optional SOCKS dependencies before a connection is made.
+        proxies = {key: "" for key in os.environ if key.lower().endswith("_proxy")}
+        with patch.dict(os.environ, proxies):
+            assert_sdk_smoke(self, run_sdk_smoke(str(self.client.url)))
 
 
 if __name__ == "__main__":

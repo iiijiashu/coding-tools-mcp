@@ -11,7 +11,7 @@ from .lifecycle import (
     LifecycleEvent,
     LifecycleRuntime,
 )
-from .recovery import RecoveryAction, RecoveryDecision, decide_recovery
+from .recovery import RecoveryAction, RecoveryBudget, RecoveryDecision, decide_recovery
 from .rehydrate import ProtectedTaskState, RehydrateBudgetExceeded, render_rehydrate
 
 __all__ = [
@@ -23,6 +23,7 @@ __all__ = [
     "LifecycleRuntime",
     "ProtectedTaskState",
     "RecoveryAction",
+    "RecoveryBudget",
     "RecoveryDecision",
     "RehydrateBudgetExceeded",
     "decide_recovery",

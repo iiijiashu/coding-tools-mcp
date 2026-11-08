@@ -125,6 +125,11 @@ Examples of non-blocking handlers:
 A blocking error stops later handlers for that event.  A non-blocking error is
 recorded and dispatch continues.
 
+Effects from each handler are collected and type-checked before publication.
+An exception while iterating a handler's results discards that handler's partial
+effects. Earlier successful handlers retain their results. Each handler may
+return at most 1,000 effects.
+
 ## Checkpoint 3: protected state and bounded rehydrate
 
 `ProtectedTaskState` separates exact task state from disposable conversation
@@ -138,8 +143,18 @@ history.  Protected fields currently include:
 - exact cleanup targets;
 - exact cleanup receipts.
 
-Working-state fields such as completed work, pending work, blockers, and evidence
-references are useful but may be clipped when a rehydrate budget is reached.
+Blockers, the next action, and pending work receive space before optional history.
+If these actionable fields and protected state exceed the budget, rendering raises
+`RehydrateBudgetExceeded`. Evidence references, verification notes, and completed
+history use the remaining space in that order.
+
+`RecoveryBudget` records retry, compaction, and fallback counts, total recovery
+limits, and an optional absolute Unix deadline. `decide_recovery()` returns the
+next budget with its decision; the caller must persist this budget before acting
+and pass it into the next decision. `ProtectedTaskState.recovery_budget` includes
+the counters in the protected fingerprint and rehydrate output. Serialization
+with `dataclasses.asdict()` and reconstruction with `RecoveryBudget(**payload)`
+preserve counters across restarts. The pure policy layer performs no storage I/O.
 
 ### No silent truncation of protected state
 

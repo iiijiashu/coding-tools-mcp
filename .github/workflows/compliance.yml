@@ -37,20 +37,8 @@ jobs:
       - name: Run typecheck
         run: make typecheck
 
-      - name: Run unit discovery
-        run: make test
-
-      - name: Run protocol gate
-        run: make test-protocol
-
-      - name: Run integration gate
-        run: make test-integration
-
-      - name: Run required docs gate
-        run: make test-docs-required
-
-      - name: Run schema drift gate
-        run: make test-schema-drift
+      - name: Run complete discovery once and write evidence
+        run: make test-ci
 
       - name: Run dispatch inputs gate
         run: make check-dispatch-inputs
@@ -59,16 +47,13 @@ jobs:
         run: make check-npm-launcher
 
       - name: Run dogfood smoke
-        run: make dogfood-smoke
+        run: make dogfood-runner
 
       - name: Run latency benchmark
         run: make benchmark-latency
 
       - name: Validate SWE-bench smoke preflight
         run: make benchmark-smoke
-
-      - name: Refresh full compliance report
-        run: make compliance
 
       - name: Upload CI evidence
         if: always()
@@ -117,6 +102,9 @@ jobs:
             throw "vcvarsall.bat not found at $vcvarsAll"
           }
           "VCVARSALL=$vcvarsAll" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run Windows lifecycle and watchdog regressions
+        run: python -m unittest tests.test_reliability_regressions tests.test_http_limits tests.test_secure_tunnel_watchdog tests.test_local_http_mcp_watchdog tests.test_control_plane_guard tests.test_pilotdeck tests.test_pilotdeck_reliability
 
       - name: Run MSVC environment inheritance smoke
         shell: cmd

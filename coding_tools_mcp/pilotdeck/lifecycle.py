@@ -4,6 +4,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
+from itertools import islice
 
 
 @dataclass(frozen=True)
@@ -74,7 +75,9 @@ class LifecycleRuntime:
     ) -> None:
         if not event_type.strip():
             raise ValueError("event_type must not be empty")
-        resolved_name = name or getattr(handler, "__name__", handler.__class__.__name__)
+        resolved_name = str(
+            name or getattr(handler, "__name__", None) or handler.__class__.__name__
+        )
         self._handlers[event_type].append(
             _RegisteredHandler(handler, blocking, resolved_name)
         )
@@ -90,9 +93,16 @@ class LifecycleRuntime:
                 if produced is None:
                     continue
                 if isinstance(produced, LifecycleEffect):
-                    effects.append(produced)
+                    pending = [produced]
                 else:
-                    effects.extend(produced)
+                    pending = list(islice(produced, 1001))
+                if len(pending) > 1000 or not all(
+                    isinstance(effect, LifecycleEffect) for effect in pending
+                ):
+                    raise ValueError(
+                        "handler must return at most 1000 LifecycleEffect values"
+                    )
+                effects.extend(pending)
             except Exception as exc:  # lifecycle policy decides whether failure blocks
                 error = LifecycleHandlerError(
                     handler=registration.name,
