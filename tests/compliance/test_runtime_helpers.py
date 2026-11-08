@@ -114,7 +114,11 @@ def fake_landlock_exec() -> Iterator[dict[str, object]]:
     server_module.subprocess.Popen = fake_popen  # type: ignore[method-assign]
     server_module.start_command_watchdog = lambda _session: None
     try:
-        yield captured
+        with (
+            patch.object(processes_module, "terminate_process_group"),
+            patch.object(processes_module, "_own_windows_process"),
+        ):
+            yield captured
     finally:
         server_module.open_landlock_ruleset = original_open
         server_module.subprocess.Popen = original_popen  # type: ignore[method-assign]
@@ -453,7 +457,7 @@ class RuntimeHelperTests(unittest.TestCase):
             # Guard against schema drift: these args must pass the same
             # validation the MCP tools/call path applies.
             server_module.validate_arguments("kill_command", kill_args)
-            with patch.object(server_module, "terminate_process_group", return_value=None):
+            with patch.object(command, "terminate", return_value=None):
                 result = runtime.kill_command(kill_args)
 
         self.assertFalse(result.get("killed"), result)

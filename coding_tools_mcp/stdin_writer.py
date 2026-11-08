@@ -6,6 +6,7 @@ import os
 import secrets
 import subprocess
 import threading
+import time
 from typing import Any
 from collections.abc import Callable
 
@@ -13,7 +14,7 @@ from .errors import ToolFailure
 
 MAX_STDIN_WRITE_BYTES = 1_048_576
 STDIN_SYNC_WAIT_SECONDS = 0.05
-STDIN_DELIVERY_TIMEOUT_SECONDS = 5.0
+STDIN_DELIVERY_TIMEOUT_SECONDS = 30.0
 _WRITER_SLOTS = threading.BoundedSemaphore(32)
 
 
@@ -102,15 +103,25 @@ class StdinWriter:
     ) -> None:
         offset = 0
         error: str | None = None
+        last_progress = time.monotonic()
 
         def expire() -> None:
-            with self.lock:
-                if receipt["status"] != "pending":
+            while not done.is_set():
+                with self.lock:
+                    if receipt["status"] != "pending":
+                        return
+                    remaining = self.delivery_timeout - (
+                        time.monotonic() - last_progress
+                    )
+                    if remaining <= 0:
+                        receipt["error"] = "delivery_timeout"
+                if remaining <= 0:
+                    self.abort()
                     return
-                receipt["error"] = "delivery_timeout"
-            self.abort()
+                if done.wait(remaining):
+                    return
 
-        timer = threading.Timer(self.delivery_timeout, expire)
+        timer = threading.Thread(target=expire)
         timer.daemon = True
         try:
             timer.start()
@@ -121,10 +132,10 @@ class StdinWriter:
                 offset += count
                 with self.lock:
                     receipt["written_bytes"] = offset
+                    last_progress = time.monotonic()
         except (OSError, ValueError, RuntimeError) as exc:
             error = type(exc).__name__
         finally:
-            timer.cancel()
             with self.lock:
                 error = receipt.get("error") or error
                 receipt["status"] = "failed" if error else "written"

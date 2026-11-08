@@ -15,6 +15,13 @@ make ci
 
 The Windows job also exercises stdin delivery, lifecycle guards, HTTP request limits, PilotDeck, and mocked watchdog policy before the MSVC smoke test. Mocked policy tests bypass only the Windows platform guard; native execution still requires Windows.
 
+Windows coverage includes native Job Object ownership, persistent services,
+transaction locks, path rules, and PowerShell recovery scripts. CI caches pip
+downloads and cancels obsolete runs of the same PR/ref. Historical checked-in
+reports are removed before validation, and evidence uploads select only current
+run outputs. Compliance categories distinguish skipped, partial and not-run
+coverage; per-tool results link to tests that actually invoked that tool.
+
 Report files are overwritten by whichever suite or benchmark was run most recently. Check `suite` in compliance reports and `conclusion` in benchmark reports before citing them.
 
 ## PyPI Release

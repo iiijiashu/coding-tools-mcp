@@ -212,7 +212,10 @@ class RuntimeReliabilityTests(unittest.TestCase):
         os.name == "posix" and Path("/proc").exists(), "Linux process-group integration"
     )
     def test_termination_cleans_child_when_parent_exits_first(self) -> None:
-        child = "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print('ready',flush=True); time.sleep(20)"
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        heartbeat = Path(temporary.name) / "heartbeat"
+        child = f"import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); p={str(heartbeat)!r}; print('ready',flush=True)\nfor _ in range(400):\n with open(p,'a') as f: f.write('alive\\n')\n time.sleep(.02)"
         parent = (
             "import subprocess,sys,time; p=subprocess.Popen([sys.executable,'-c',"
             + repr(child)
@@ -224,17 +227,16 @@ class RuntimeReliabilityTests(unittest.TestCase):
             text=True,
             start_new_session=True,
         ) as process:
-            child_pid = int(process.stdout.readline())
+            self.assertTrue(process.stdout.readline().strip())
             try:
+                time.sleep(.1)
+                before = heartbeat.stat().st_size
+                time.sleep(.1)
+                self.assertGreater(heartbeat.stat().st_size, before)
                 terminate_process_group(process, signal.SIGTERM)
-                deadline = time.monotonic() + 2
-                while time.monotonic() < deadline:
-                    path = Path(f"/proc/{child_pid}/stat")
-                    if not path.exists() or path.read_text().split()[2] == "Z":
-                        break
-                    time.sleep(0.02)
-                else:
-                    self.fail("child still running after process-group termination")
+                stopped = heartbeat.stat().st_size
+                time.sleep(.12)
+                self.assertEqual(heartbeat.stat().st_size, stopped)
             finally:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)

@@ -442,7 +442,7 @@ Supports `*** Add File`, `*** Update File`, `*** Delete File`, and
 
 ### exec_command
 
-Inputs: `"cmd"`, `"workdir"`, `"cwd"`, `"timeout_ms"`, `"yield_time_ms"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`, `"stdin"`, `"tty"`, `"interactive"`, `"env"`.
+Inputs: `"cmd"`, `"workdir"`, `"cwd"`, `"timeout_ms"`, `"yield_time_ms"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`, `"stdin"`, `"tty"`, `"interactive"`, `"background"`, `"env"`.
 
 Annotations: `{"title":"Execute command","readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}`.
 
@@ -452,6 +452,22 @@ exits use `terminated`. Ordinary non-zero exit codes still use `exited`.
 `"workdir"` is workspace-relative and defaults to the workspace root.
 `"interactive": true` keeps pipe-backed stdin open for later `write_stdin`
 calls, including on Windows builds where `"tty": true` is unavailable.
+
+Use `"background": true` for an explicitly requested persistent service. Run
+the service in the foreground within that command (avoid a second self-daemonizing
+launcher). It returns immediately, ignores `timeout_ms`, uses closed stdin,
+and writes stdout/stderr directly to files under `.coding-tools-mcp/services/`.
+It survives client disconnects and runtime shutdown. `tty`, `interactive`, and
+nonempty `stdin` are incompatible with this mode. The result includes the PID,
+log paths, and command handle; a sibling `manifest.json` preserves those details.
+While this backend is running, use the usual `write_stdin`/`read_output`/`kill_command`
+tools to observe or stop it. After a backend restart, use the saved PID/log details
+for manual management; automatic reattachment is outside this lightweight mode.
+Service log files and the runtime directories used by its environment remain on
+disk until explicitly cleaned up. Log files have no automatic rotation.
+For example: `{"cmd":"python -m http.server 8000","background":true}`.
+Check the returned logs or application health endpoint to confirm readiness;
+process creation returns before the application finishes starting.
 
 Example: `{"cmd":"pytest -q","workdir":".","yield_time_ms":30000}`.
 
@@ -582,8 +598,10 @@ consumption. Poll with empty `chars` while delivery is pending; never replay an
 accepted write. `STDIN_BUSY` accepts no additional input. Each write is limited
 to 1 MiB, with one outstanding write per command and at most 32 writers per
 server process. Calls wait at most 50 ms for delivery before returning a receipt.
-A five-second delivery deadline terminates a stalled command and records
-`delivery_timeout`; non-interactive EOF is deferred until admitted input drains.
+A thirty-second interval without write progress terminates a stalled command
+and records `delivery_timeout`; every successful write resets this idle interval.
+The command's total timeout still applies independently. Non-interactive EOF
+is deferred until admitted input drains.
 
 `read_output` preserves complete UTF-8 or detected Windows locale characters
 across pages. Follow `next_offset` as a byte cursor. A page smaller than one
@@ -597,6 +615,13 @@ written and fsynced. `started_persisted`, `finished_persisted`, and `storage_err
 expose partial failures. `server_info.mutation_receipt_health` reports storage
 status and failure count. A failed receipt write leaves the actual tool result
 intact and explicitly marks the missing durable evidence.
+Empty `write_stdin` polls use the normal tool trace and produce no mutation
+receipts or receipt fsync calls.
+
+Ordinary commands own their process group through completion and runtime shutdown,
+including descendants whose parent exited first. Windows processes are created
+suspended, assigned to a native Job Object, and then resumed. Ordinary jobs use
+kill-on-close; explicit background jobs retain their members on runtime shutdown.
 
 HTTP requests have a ten-second absolute header/body read deadline and at most
 32 active handlers per server. Saturation returns 503 with `Retry-After: 1`.

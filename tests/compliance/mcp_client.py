@@ -17,10 +17,12 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from collections.abc import Callable
 
 
 PROTOCOL_VERSION = "2025-11-25"
 ROOT = Path(__file__).resolve().parents[2]
+tool_call_observer: Callable[[str], None] | None = None
 
 REQUIRED_TOOLS = (
     "server_info",
@@ -220,6 +222,8 @@ class MCPClient:
         return tools
 
     def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+        if tool_call_observer is not None:
+            tool_call_observer(name)
         return self.rpc("tools/call", {"name": name, "arguments": arguments or {}})
 
     def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
@@ -397,6 +401,8 @@ class StdioMCPClient:
             self.stderr_lines.append(line)
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool_call_observer is not None:
+            tool_call_observer(name)
         return self.rpc("tools/call", {"name": name, "arguments": arguments})
 
     def notify(self, method: str, params: dict[str, Any] | None = None) -> None:

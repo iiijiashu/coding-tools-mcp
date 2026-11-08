@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from tests.compliance.mcp_client import REQUIRED_TOOLS
+from tests.compliance import mcp_client
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -49,10 +50,18 @@ class RecordingResult(unittest.TextTestResult):
         super().__init__(*args, **kwargs)
         self.records: list[FailureRecord] = []
         self.test_ids: list[str] = []
+        self.tool_tests: dict[str, set[str]] = {}
+        self._observer_stack: list[Any] = []
 
     def startTest(self, test: unittest.case.TestCase) -> None:
         self.test_ids.append(test.id())
+        self._observer_stack.append(mcp_client.tool_call_observer)
+        mcp_client.tool_call_observer = lambda tool: self.tool_tests.setdefault(tool, set()).add(test.id())
         super().startTest(test)
+
+    def stopTest(self, test: unittest.case.TestCase) -> None:
+        mcp_client.tool_call_observer = self._observer_stack.pop()
+        super().stopTest(test)
 
     def addFailure(self, test: unittest.case.TestCase, err: tuple[type[BaseException], BaseException, Any]) -> None:
         super().addFailure(test, err)
@@ -61,6 +70,12 @@ class RecordingResult(unittest.TextTestResult):
     def addError(self, test: unittest.case.TestCase, err: tuple[type[BaseException], BaseException, Any]) -> None:
         super().addError(test, err)
         self.records.append(make_record(test, "error", err))
+
+    def addSubTest(self, test: unittest.case.TestCase, subtest: unittest.case.TestCase, err: Any) -> None:
+        super().addSubTest(test, subtest, err)
+        if err is not None:
+            # Attribute subtest failures to the test that exercised the tool.
+            self.records.append(make_record(test, "subtest", err))
 
 
 class RecordingRunner(unittest.TextTestRunner):
@@ -127,7 +142,7 @@ def write_reports(
 ) -> dict[str, Any]:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     failures = [] if result is None else [record.__dict__ for record in result.records]
-    passed = bool(result and result.wasSuccessful())
+    passed = bool(result and result.wasSuccessful() and result.testsRun > len(result.skipped))
     report: dict[str, Any] = {
         "contract": CONTRACT,
         "commit": git_commit(),
@@ -143,6 +158,7 @@ def write_reports(
         "e2e": category_status(result, "tests.compliance.test_e2e"),
         "dogfood": category_status(result, "tests.compliance.test_dogfood"),
         "tests_run": 0 if result is None else result.testsRun,
+        "tool_evidence_tests": {} if result is None else {name: sorted(ids) for name, ids in result.tool_tests.items()},
         "failures": failures,
         "skipped": [] if result is None else [test.id() for test, _reason in result.skipped],
         "write_only": write_only,
@@ -162,10 +178,21 @@ def required_tool_statuses(
         status = "not_run"
     elif suite_name not in {"all", "discovery"}:
         status = "not_measured"
-    elif passed:
-        status = "passed"
+    elif not result.test_ids:
+        status = "not_run"
+    elif set(result.test_ids).issubset({test.id() for test, _ in result.skipped}):
+        status = "skipped"
     else:
-        status = "failed"
+        executed = set(result.test_ids) - {test.id() for test, _ in result.skipped}
+        failures = {record.test for record in result.records}
+        return {
+            tool: (
+                "failed" if result.tool_tests.get(tool, set()) & failures
+                else "passed" if result.tool_tests.get(tool, set()) & executed
+                else "not_measured"
+            )
+            for tool in REQUIRED_TOOLS
+        }
     return {tool: status for tool in REQUIRED_TOOLS}
 
 
@@ -178,6 +205,11 @@ def category_status(result: RecordingResult | None, module_prefix: str) -> str:
     matching_failures = [record for record in result.records if record.test.startswith(module_prefix)]
     if matching_failures:
         return "failed"
+    skipped = {test.id() for test, _ in result.skipped}
+    if all(test_id in skipped for test_id in matching_runs):
+        return "skipped"
+    if any(test_id in skipped for test_id in matching_runs):
+        return "partial"
     return "passed"
 
 
@@ -236,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
     elapsed = time.time() - start
     if args.report:
         write_reports(suite_name=args.suite, result=result, elapsed_seconds=elapsed)
-    return 0 if result.wasSuccessful() else 1
+    return 0 if result.wasSuccessful() and result.testsRun > len(result.skipped) else 1
 
 
 if __name__ == "__main__":
