@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "task_path": "\\",
+  "pythonw_relative": ".venv/Scripts/pythonw.exe",
+  "tool_catalog": {
+    "required_tools": [
+      "server_info",
+      "computer_screenshot",
+      "computer_mouse",
+      "computer_keyboard",
+      "computer_launch"
+    ]
+  },
+  "tunnel": {
+    "main_arguments_sha256": "e57538e1c619b731da65b26c48d50b566b6af9fa3a90ecb79497a4b44a13388d",
+    "executable_sha256": "7d3c7d492ce84b52835e11865a835a8a5bcd4a669dee84e169aa11b314dc952a"
+  },
+  "tasks": {
+    "http": {
+      "name": "Coding Tools MCP HTTP - Local D Drive",
+      "script_relative": "scripts/run_local_mcp_http_task.py",
+      "run_level": "Highest",
+      "must_be_running": true,
+      "required_triggers": ["registration"],
+      "restart_on_failure": false,
+      "allow_time_trigger": false,
+      "loop_interval_seconds": 0,
+      "pin_tool_catalog": false,
+      "pin_main_arguments": false
+    },
+    "http_watchdog": {
+      "name": "Coding Tools MCP HTTP Watchdog - Local D Drive",
+      "script_relative": "scripts/local_http_mcp_watchdog.py",
+      "run_level": "Highest",
+      "must_be_running": true,
+      "required_triggers": ["registration", "logon"],
+      "restart_on_failure": true,
+      "allow_time_trigger": false,
+      "loop_interval_seconds": 60,
+      "pin_tool_catalog": true,
+      "pin_main_arguments": false
+    },
+    "tunnel": {
+      "name": "OpenAI Secure MCP Tunnel - Local D Drive Coding Tools",
+      "script_relative": null,
+      "run_level": "Limited",
+      "must_be_running": true,
+      "required_triggers": ["registration"],
+      "restart_on_failure": false,
+      "allow_time_trigger": false,
+      "loop_interval_seconds": 0,
+      "pin_tool_catalog": false,
+      "pin_main_arguments": false
+    },
+    "tunnel_watchdog": {
+      "name": "OpenAI Secure MCP Tunnel Watchdog - Local D Drive Coding Tools",
+      "script_relative": "scripts/secure_tunnel_watchdog.py",
+      "run_level": "Limited",
+      "must_be_running": true,
+      "required_triggers": ["registration", "logon"],
+      "restart_on_failure": true,
+      "allow_time_trigger": false,
+      "loop_interval_seconds": 15,
+      "pin_tool_catalog": true,
+      "pin_main_arguments": true
+    },
+    "manager": {
+      "name": "Coding Tools MCP Control Plane Manager - Local D Drive",
+      "script_relative": "scripts/control_plane_transaction.py",
+      "run_level": "Highest",
+      "must_be_running": false,
+      "required_triggers": ["registration", "logon"],
+      "restart_on_failure": true,
+      "allow_time_trigger": false,
+      "loop_interval_seconds": 60,
+      "pin_tool_catalog": false,
+      "pin_main_arguments": false
+    }
+  }
+}

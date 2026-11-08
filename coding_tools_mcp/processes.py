@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -9,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, BinaryIO
 
 from .errors import ToolFailure
-from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_tail
+from .textutils import DEFAULT_MAX_LINES, TextTruncation, decode_output_bytes, truncate_text_tail
 
 
 COMMAND_BUFFER_BYTES = 524_288
@@ -21,14 +22,62 @@ COMMAND_HEAD_BUFFER_DIVISOR = 8
 HARD_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
+def hidden_process_popen_kwargs() -> dict[str, Any]:
+    """Return Windows flags that keep background helper processes off-screen."""
+
+    if os.name != "nt":
+        return {}
+    kwargs: dict[str, Any] = {}
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if creation_flags:
+        kwargs["creationflags"] = creation_flags
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    kwargs["startupinfo"] = startupinfo
+    return kwargs
+
+
+def _force_terminate_windows_process_tree(process: subprocess.Popen[bytes]) -> None:
+    """Terminate one exact Windows process tree, falling back to the parent."""
+
+    taskkill = shutil.which("taskkill.exe") or shutil.which("taskkill")
+    if taskkill:
+        try:
+            completed = subprocess.run(
+                [taskkill, "/PID", str(process.pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if completed.returncode == 0:
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
+    process.kill()
+    try:
+        process.wait(timeout=1)
+    except Exception:
+        pass
+
+
 def terminate_process_group(
     process: subprocess.Popen[bytes],
     signum: signal.Signals,
     *,
     force: bool = False,
 ) -> None:
-    if not hasattr(os, "killpg"):
-        if os.name == "nt" and not force:
+    if os.name == "nt":
+        if force:
+            _force_terminate_windows_process_tree(process)
+            return
+        if not force:
             event = getattr(signal, "CTRL_BREAK_EVENT", None)
             if event is not None:
                 try:
@@ -37,6 +86,13 @@ def terminate_process_group(
                     return
                 except Exception:
                     pass
+        try:
+            process.terminate()
+            process.wait(timeout=1)
+        except Exception:
+            process.kill()
+        return
+    if not hasattr(os, "killpg"):
         try:
             if force:
                 process.kill()
@@ -452,7 +508,7 @@ def _trim_buffer(
 
 def truncate_output_bytes_tail(data: bytes, max_bytes: int, max_lines: int = DEFAULT_MAX_LINES) -> TextTruncation:
     return truncate_text_tail(
-        data.decode("utf-8", errors="replace"),
+        decode_output_bytes(data),
         max_lines=max_lines,
         max_bytes=max_bytes,
     )

@@ -8,6 +8,10 @@ The first implementation is intentionally **deterministic, local-first, and
 side-effect free until explicitly wired**.  It must not add an LLM judge, memory
 extractor, background discovery loop, MCP tool, or web/client request on its own.
 
+These primitives live in `coding_tools_mcp.pilotdeck`. The existing
+`coding_tools_mcp.control_plane` module owns deployment mutation guards; keeping
+the namespaces distinct preserves its imports and MCP server startup.
+
 ## Goals
 
 1. Normalize agent/executor failures into a stable contract so recovery does not
@@ -52,7 +56,7 @@ These are release blockers for later integration work:
 
 ## Checkpoint 1: canonical errors and recovery
 
-`coding_tools_mcp.control_plane.errors` defines provider-agnostic categories such
+`coding_tools_mcp.pilotdeck.errors` defines provider-agnostic categories such
 as transport, timeout, provider, auth, billing, context overflow, invalid output,
 capability missing, permission denied, stale result, process crash, and task
 failure.
@@ -199,6 +203,8 @@ latency, failure recovery rate, and background concurrency against a baseline.
 A change is not ready for production wiring unless all of the following hold:
 
 - Existing patch/process/protocol tests remain green.
+- The MCP CLI starts in a fresh process and serves initialization, tool-list, and
+  ping requests with the PilotDeck package present.
 - A retry requires replay safety and respects its retry budget.
 - Streamed output prevents transparent retry/fallback.
 - Possible side effects prevent replay unless explicitly safe.

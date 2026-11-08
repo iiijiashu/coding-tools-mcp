@@ -1,10 +1,30 @@
 from __future__ import annotations
 
+import locale
+import os
 from dataclasses import dataclass
 from typing import Any
 
 
 DEFAULT_MAX_LINES = 2000
+
+
+def decode_output_bytes(data: bytes) -> str:
+    """Decode command output without corrupting UTF-8 or Windows OEM text."""
+
+    try:
+        return data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        pass
+    if os.name == "nt":
+        getencoding = getattr(locale, "getencoding", None)
+        encoding = (getencoding() if getencoding is not None else locale.getpreferredencoding(False)) or "utf-8"
+        if encoding.lower().replace("-", "") not in {"utf8", "utf8sig"}:
+            try:
+                return data.decode(encoding, errors="strict")
+            except (LookupError, UnicodeDecodeError):
+                pass
+    return data.decode("utf-8", errors="replace")
 
 
 @dataclass(frozen=True)

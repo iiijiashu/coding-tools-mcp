@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from coding_tools_mcp.control_plane import (
+from coding_tools_mcp.pilotdeck import (
     AgentErrorCategory,
     CanonicalAgentError,
     LifecycleEffect,
@@ -14,6 +20,46 @@ from coding_tools_mcp.control_plane import (
     decide_recovery,
     render_rehydrate,
 )
+
+
+class RuntimeCompatibilityTests(unittest.TestCase):
+    def test_mcp_cli_starts_and_serves_requests_with_pilotdeck_installed(self) -> None:
+        requests = [
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pilotdeck-compatibility-test", "version": "1"},
+                },
+            },
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "ping"},
+        ]
+        with TemporaryDirectory() as workspace:
+            completed = subprocess.run(
+                [sys.executable, "-m", "coding_tools_mcp", "--workspace", workspace, "--stdio"],
+                input="".join(json.dumps(request) + "\n" for request in requests),
+                cwd=Path(__file__).resolve().parents[1],
+                env={**os.environ, "CODING_TOOLS_MCP_TELEMETRY": "off"},
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        responses = [json.loads(line) for line in completed.stdout.splitlines()]
+        self.assertEqual([response["id"] for response in responses], [1, 2, 3])
+        for response in responses:
+            self.assertNotIn("error", response)
+        self.assertEqual(responses[0]["result"]["protocolVersion"], "2025-11-25")
+        tool_names = {tool["name"] for tool in responses[1]["result"]["tools"]}
+        self.assertIn("server_info", tool_names)
+        self.assertIn("exec_command", tool_names)
+        self.assertEqual(responses[2]["result"], {})
 
 
 class RecoveryPolicyTests(unittest.TestCase):

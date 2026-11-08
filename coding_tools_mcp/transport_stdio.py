@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 import sys
-from typing import Any, Protocol, TextIO
+from typing import Any, BinaryIO, Protocol, TextIO
 
 from .protocol import (
     RequestContext,
@@ -45,13 +46,28 @@ class StdioRuntime(Protocol):
 def serve_stdio(
     runtime: StdioRuntime,
     *,
-    input_stream: TextIO | None = None,
-    output_stream: TextIO | None = None,
+    input_stream: TextIO | BinaryIO | None = None,
+    output_stream: TextIO | BinaryIO | None = None,
 ) -> int:
-    source = input_stream or sys.stdin
-    sink = output_stream or sys.stdout
+    # MCP stdio is UTF-8 regardless of the Windows console code page.  Use the
+    # underlying binary streams by default so Python's locale-selected text
+    # wrappers (commonly cp936/GBK) cannot corrupt or reject JSON-RPC frames.
+    source: TextIO | BinaryIO = input_stream if input_stream is not None else sys.stdin.buffer
+    sink: TextIO | BinaryIO = output_stream if output_stream is not None else sys.stdout.buffer
+    binary_sink = not isinstance(sink, io.TextIOBase)
     try:
-        for line in source:
+        for raw_line in source:
+            if isinstance(raw_line, bytes):
+                try:
+                    line = raw_line.decode("utf-8", errors="strict")
+                except UnicodeDecodeError:
+                    response = jsonrpc_error(None, -32700, "Parse error")
+                    payload = json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n"
+                    sink.write(payload.encode("utf-8") if binary_sink else payload)  # type: ignore[arg-type]
+                    sink.flush()
+                    continue
+            else:
+                line = raw_line
             if not line.strip():
                 continue
             try:
@@ -79,9 +95,8 @@ def serve_stdio(
                         str(exc),
                     )
             if response is not None:
-                sink.write(
-                    json.dumps(response, separators=(",", ":")) + "\n"
-                )
+                payload = json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n"
+                sink.write(payload.encode("utf-8") if binary_sink else payload)  # type: ignore[arg-type]
                 sink.flush()
     finally:
         runtime.close()

@@ -12,7 +12,8 @@ Dogfood verifies that the MCP server can act as a coding-agent backend through M
 - Direct filesystem/shell bypass during task execution: `False`
 
 The deterministic runner exercises `server_info`, repo search/read, two
-patch-and-test loops, `git_diff`, a real PTY stdin command, `kill_command`, and
+patch-and-test loops, `git_diff`, interactive stdin (PTY on POSIX and a
+pipe-backed process on Windows), `kill_command`, and
 workspace escape denial. The broader compliance suite separately covers every
 catalog tool, timeouts, output paging, `view_image`, binary rejection, both
 protocol eras, OAuth, and transport edge cases.

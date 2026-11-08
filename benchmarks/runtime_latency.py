@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shlex
 import shutil
 import socket
 import subprocess
@@ -22,6 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from benchmarks.mcp_http import McpHttpClient, connect_with_retry  # noqa: E402
+from benchmarks.platform_commands import native_echo_arguments, render_process_command  # noqa: E402
 
 
 @dataclass
@@ -72,15 +72,14 @@ def prepare_workspace(root: Path) -> Path:
 
 
 def start_server(command: str, workspace: Path, port: int) -> subprocess.Popen[bytes]:
-    rendered = command.format(
-        python=shlex.quote(sys.executable),
-        workspace=shlex.quote(str(workspace)),
-        port=port,
+    process_command = render_process_command(
+        command,
+        {"python": sys.executable, "workspace": workspace, "port": port},
     )
     env = os.environ.copy()
     env["CODING_TOOLS_MCP_WORKSPACE"] = str(workspace)
     return subprocess.Popen(
-        shlex.split(rendered),
+        process_command,
         cwd=str(ROOT),
         env=env,
         stdout=subprocess.DEVNULL,
@@ -88,8 +87,12 @@ def start_server(command: str, workspace: Path, port: int) -> subprocess.Popen[b
     )
 
 
-def connect(endpoint: str, timeout_seconds: float) -> McpHttpClient:
-    client, _, error = connect_with_retry(endpoint, timeout_seconds)
+def connect(endpoint: str, timeout_seconds: float, request_timeout: float) -> McpHttpClient:
+    client, _, error = connect_with_retry(
+        endpoint,
+        timeout_seconds,
+        request_timeout=request_timeout,
+    )
     if client is None:
         raise RuntimeError(f"MCP server did not initialize: {error}")
     return client
@@ -163,7 +166,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     endpoint = f"http://127.0.0.1:{port}/mcp"
     server = start_server(args.server_command, workspace, port)
     try:
-        client = connect(endpoint, args.startup_timeout)
+        client = connect(endpoint, args.startup_timeout, args.request_timeout)
         tools = {tool.get("name") for tool in client.list_tools()}
         required = {"tools/list", "read_file", "search_text", "exec_command"}
         missing = sorted(required - (tools | {"tools/list"}))
@@ -195,7 +198,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     client.call_tool(
                         "exec_command",
                         {
-                            "cmd": "printf ok",
+                            "cmd": "echo ok",
                             "timeout_ms": 5000,
                             "yield_time_ms": 5000,
                             "max_output_bytes": 4000,
@@ -215,7 +218,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 args.exec_iterations,
                 args.warmup,
                 lambda: subprocess.run(
-                    ["printf", "ok"],
+                    native_echo_arguments(),
                     cwd=str(workspace),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -326,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--startup-timeout", type=float, default=10)
+    parser.add_argument("--request-timeout", type=float, default=30)
     parser.add_argument("--max-p95-ms", type=float, default=5000)
     parser.add_argument(
         "--server-command",

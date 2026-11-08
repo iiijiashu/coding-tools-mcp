@@ -12,8 +12,8 @@ import argparse
 import json
 import os
 import re
-import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -27,6 +27,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from benchmarks.mcp_http import McpHttpClient, McpHttpError, connect_with_retry  # noqa: E402 - repo path is bootstrapped above
+from benchmarks.platform_commands import (  # noqa: E402 - repo path is bootstrapped above
+    is_windows,
+    join_shell_command,
+    outside_file_read_command,
+    render_process_command,
+    split_command_arguments,
+)
 from benchmarks.runtime_latency import percentile  # noqa: E402 - repo path is bootstrapped above
 
 
@@ -187,6 +194,8 @@ class ToolAdapter:
         cwd: str | None = None,
         timeout_seconds: int = 10,
         tty: bool = False,
+        interactive: bool = False,
+        yield_time_ms: int | None = None,
     ) -> dict[str, Any]:
         canonical: dict[str, Any] = {
             "cmd": command,
@@ -196,15 +205,19 @@ class ToolAdapter:
             "timeout_seconds": timeout_seconds,
             "timeout_ms": timeout_seconds * 1000,
             "max_output_bytes": 40_000,
-            "yield_time_ms": 1000 if tty else min(timeout_seconds * 1000, 20000),
+            "yield_time_ms": (
+                yield_time_ms
+                if yield_time_ms is not None
+                else (1000 if tty else min(timeout_seconds * 1000, 20000))
+            ),
             "tty": tty,
-            "interactive": tty,
+            "interactive": tty or interactive,
         }
         if cwd:
             canonical.update({"cwd": cwd, "workdir": cwd, "working_directory": cwd})
         args = self._args("exec_command", canonical)
         if "cmd" not in args and "command" not in args and "argv" in self._properties("exec_command"):
-            args["argv"] = shlex.split(command)
+            args["argv"] = split_command_arguments(command)
         return args
 
     def write_stdin_args(self, command_id: str, chars: str) -> dict[str, Any]:
@@ -299,7 +312,7 @@ class DogfoodRunner:
         test = self.call(
             "exec_command",
             self.adapter.exec_args(
-                f"{shlex.quote(sys.executable)} -m unittest discover -s tests",
+                join_shell_command([sys.executable, "-m", "unittest", "discover", "-s", "tests"]),
                 cwd="tiny-python-project",
                 timeout_seconds=20,
             ),
@@ -314,10 +327,12 @@ class DogfoodRunner:
         started = self.call(
             "exec_command",
             self.adapter.exec_args(
-                f"{shlex.quote(sys.executable)} repl.py",
+                join_shell_command([sys.executable, "repl.py"]),
                 cwd="long-running-project",
                 timeout_seconds=30,
-                tty=True,
+                tty=not is_windows(),
+                interactive=True,
+                yield_time_ms=1000,
             ),
         )
         command_id = find_command_id(started)
@@ -344,7 +359,7 @@ class DogfoodRunner:
         case.add_check("apply_patch rejects ../ escape", rejected_as_expected(patch), summarize(patch))
         escaped = self.call(
             "exec_command",
-            self.adapter.exec_args("cat ../outside-secret.txt", timeout_seconds=10),
+            self.adapter.exec_args(outside_file_read_command("../outside-secret.txt"), timeout_seconds=10),
             expected_rejection=True,
         )
         leaked_secret = result_contains(escaped, "DOGFOOD-OUTSIDE-SECRET")
@@ -399,12 +414,35 @@ def prepare_workspace(base_dir: Path | None = None) -> tuple[Path, Path]:
         root.mkdir(parents=True, exist_ok=True)
     workspace = root / "workspace"
     if workspace.exists():
-        shutil.rmtree(workspace)
+        def remove_readonly(function: Any, path: str, exc_info: tuple[type[BaseException], BaseException, Any]) -> None:
+            if not isinstance(exc_info[1], PermissionError):
+                raise exc_info[1]
+            os.chmod(path, stat.S_IWRITE)
+            function(path)
+
+        shutil.rmtree(workspace, onerror=remove_readonly)
     workspace.mkdir(parents=True)
     for relative, content in FIXTURE_FILES.items():
         target = workspace / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+    subprocess.run(["git", "init", "--quiet"], cwd=workspace, check=True)
+    subprocess.run(["git", "add", "--all"], cwd=workspace, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Coding Tools MCP Dogfood",
+            "-c",
+            "user.email=dogfood@localhost.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "dogfood fixture baseline",
+        ],
+        cwd=workspace,
+        check=True,
+    )
     (root / "outside-secret.txt").write_text("DOGFOOD-OUTSIDE-SECRET\n", encoding="utf-8")
     return root, workspace
 
@@ -415,12 +453,30 @@ def start_server(command: str | None, workspace: Path, endpoint: str) -> subproc
     env = os.environ.copy()
     env.setdefault("CODING_TOOLS_MCP_WORKSPACE", str(workspace))
     env.setdefault("CODING_TOOLS_MCP_ENDPOINT", endpoint)
-    argv = shlex.split(command.format(workspace=str(workspace), endpoint=endpoint))
-    return subprocess.Popen(argv, cwd=str(ROOT), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    process_command = render_process_command(
+        command,
+        {"workspace": workspace, "endpoint": endpoint},
+    )
+    return subprocess.Popen(
+        process_command,
+        cwd=str(ROOT),
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
-def connect(endpoint: str, startup_timeout: float) -> tuple[McpHttpClient | None, dict[str, Any] | None, str | None]:
-    return connect_with_retry(endpoint, startup_timeout, poll_interval=0.25)
+def connect(
+    endpoint: str,
+    startup_timeout: float,
+    request_timeout: float,
+) -> tuple[McpHttpClient | None, dict[str, Any] | None, str | None]:
+    return connect_with_retry(
+        endpoint,
+        startup_timeout,
+        poll_interval=0.25,
+        request_timeout=request_timeout,
+    )
 
 
 def result_text(result: dict[str, Any]) -> str:
@@ -650,6 +706,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--server-command", default=None)
     parser.add_argument("--fixture-root", type=Path, default=None)
     parser.add_argument("--startup-timeout", type=float, default=5.0)
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=60.0,
+        help="HTTP timeout per MCP call; must exceed the longest benchmark command.",
+    )
     parser.add_argument("--report-json", type=Path, default=ROOT / "reports/dogfood/coding-tools-dogfood.json")
     parser.add_argument("--report-md", type=Path, default=ROOT / "reports/dogfood/coding-tools-dogfood.md")
     parser.add_argument("--transcript-json", type=Path, default=ROOT / "docs/dogfood/coding-tools-dogfood-transcript.json")
@@ -676,7 +738,11 @@ def main(argv: list[str] | None = None) -> int:
         "known_limitations": [],
     }
     try:
-        client, initialize_result, connect_error = connect(args.endpoint, args.startup_timeout)
+        client, initialize_result, connect_error = connect(
+            args.endpoint,
+            args.startup_timeout,
+            args.request_timeout,
+        )
         report["initialize"] = initialize_result
         if client is None:
             report["known_limitations"].append(f"No local MCP HTTP server was reachable: {connect_error}")

@@ -32,6 +32,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 from . import __version__
+from . import computer as computer_tools
+from .control_plane import control_plane_command_violation, is_protected_control_plane_path
 from .envutils import ENV_PREFIX, truthy_env
 from .errors import JsonRpcError, ToolFailure
 from .landlock_exec import libc_syscall
@@ -62,6 +64,7 @@ from .processes import (
     COMMAND_BUFFER_BYTES,
     COMMAND_HEAD_BUFFER_DIVISOR,
     CommandRun,
+    hidden_process_popen_kwargs,
     spawn_process,
     start_reader_threads,
     start_command_watchdog,
@@ -87,7 +90,7 @@ from .protocol import (
 )
 from .project_context import ProjectContext, load_project_context
 from .telemetry import SessionTelemetry
-from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_head
+from .textutils import DEFAULT_MAX_LINES, TextTruncation, decode_output_bytes, truncate_text_head
 from .tool_results import make_tool_result
 from .transport_stdio import serve_stdio
 
@@ -143,6 +146,7 @@ class ModeCapabilities:
     landlock: bool
     secret_env_filter: bool
     global_tmp_write: str  # "blocked" | "tmp-prefix" | "allowed"
+    computer_control: bool
     skip_all_permissions: bool
 
 
@@ -154,6 +158,7 @@ PERMISSION_MODE_CAPABILITIES: dict[str, ModeCapabilities] = {
         landlock=True,
         secret_env_filter=True,
         global_tmp_write="blocked",
+        computer_control=False,
         skip_all_permissions=False,
     ),
     "trusted": ModeCapabilities(
@@ -163,6 +168,7 @@ PERMISSION_MODE_CAPABILITIES: dict[str, ModeCapabilities] = {
         landlock=True,
         secret_env_filter=True,
         global_tmp_write="tmp-prefix",
+        computer_control=True,
         skip_all_permissions=False,
     ),
     "dangerous": ModeCapabilities(
@@ -172,10 +178,12 @@ PERMISSION_MODE_CAPABILITIES: dict[str, ModeCapabilities] = {
         landlock=False,
         secret_env_filter=False,
         global_tmp_write="allowed",
+        computer_control=True,
         skip_all_permissions=True,
     ),
 }
 PERMISSION_MODE_CHOICES = tuple(PERMISSION_MODE_CAPABILITIES)
+OUTSIDE_READ_POLICY_CHOICES = ("deny", "request")
 # Documented kill_command status enum; guarded by test_schema_drift.
 KILL_COMMAND_STATUSES = ("terminated", "killed", "exited", "terminating", "not_found")
 POSIX_CORE_ENV_NAMES = {"PATH", "LANG", "LC_ALL", "TERM"}
@@ -188,16 +196,30 @@ NETWORK_RE = re.compile(
     re.I,
 )
 SHELL_EXPANSION_RE = re.compile(r"(`|\$\(|\$\{)")
+WINDOWS_SHELL_EXPANSION_RE = re.compile(r"%[^%\r\n]+%|![^!\r\n]+!|\^")
 DESTRUCTIVE_RE = re.compile(
     r"(^|\s)(sudo|su|chmod\s+-R|chown\s+-R|mkfs|mount|umount|find\b[^;&|]*\s-delete\b|git\b[^;&|]*\breset\s+--hard\b|git\b[^;&|]*\bclean\s+-[^\s]*[fx][^\s]*|rm\s+-[^\s]*r[^\s]*f|rm\s+-[^\s]*f[^\s]*r)\b",
     re.I,
 )
 MAX_HTTP_REQUEST_BYTES = 1_048_576
 EXEC_PREVIEW_BYTES = 4096
+HTTP_SYNC_WAIT_CAP_MS = 3000
 MAX_ACTIVE_COMMANDS = 16
 MAX_RETAINED_OUTPUT_COMMANDS = 32
 COMPLETED_COMMAND_TTL_SECONDS = 300
 MAX_RUNTIME_OUTPUT_BYTES = 16 * 1024 * 1024
+MUTATION_RECEIPT_MAX_BYTES = 5 * 1024 * 1024
+MUTATING_TOOL_NAMES = frozenset(
+    {
+        "apply_patch",
+        "exec_command",
+        "write_stdin",
+        "kill_command",
+        "computer_mouse",
+        "computer_keyboard",
+        "computer_launch",
+    }
+)
 _COMMAND_RECOVERY_HINT = (
     "This command_id has expired or never existed; a finished command keeps its"
     f" output for {COMPLETED_COMMAND_TTL_SECONDS} seconds and only the last"
@@ -205,6 +227,129 @@ _COMMAND_RECOVERY_HINT = (
     " same command_id cannot succeed. Start the work again with exec_command and"
     " use the command_id it returns."
 )
+
+
+class HTTPInstanceConflict(RuntimeError):
+    def __init__(self, owner: dict[str, Any]) -> None:
+        super().__init__("another Coding Tools MCP instance owns this HTTP endpoint")
+        self.owner = owner
+
+
+class HTTPInstanceLease:
+    """Kernel-backed single-owner lease with non-secret diagnostic metadata."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        workspace: Path,
+        *,
+        state_root: Path | None = None,
+    ) -> None:
+        default_root = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+        self.state_root = (state_root or default_root / "CodingToolsMCP" / "instances").resolve()
+        identity = hashlib.sha256(f"{host}:{port}".encode("utf-8")).hexdigest()[:20]
+        self.lock_path = self.state_root / f"http-{identity}.lock"
+        self.metadata_path = self.state_root / f"http-{identity}.json"
+        self.host = host
+        self.port = int(port)
+        self.workspace = workspace.expanduser().resolve(strict=True)
+        self.pid = os.getpid()
+        self.generation = secrets.token_urlsafe(12)
+        self._stream: Any = None
+
+    def _lock(self) -> None:
+        assert self._stream is not None
+        self._stream.seek(0, os.SEEK_END)
+        if self._stream.tell() < 1:
+            self._stream.write(b"0")
+            self._stream.flush()
+        self._stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(self._stream.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self._stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock(self) -> None:
+        assert self._stream is not None
+        self._stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(self._stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
+
+    def _read_owner(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return {"host": self.host, "port": self.port, "state": "owner_metadata_pending"}
+        return payload if isinstance(payload, dict) else {"host": self.host, "port": self.port}
+
+    def acquire(self) -> None:
+        if self._stream is not None:
+            raise RuntimeError("HTTP instance lease is already acquired")
+        self.state_root.mkdir(parents=True, exist_ok=True)
+        stream = self.lock_path.open("a+b")
+        self._stream = stream
+        try:
+            self._lock()
+        except OSError as exc:
+            owner = self._read_owner()
+            stream.close()
+            self._stream = None
+            raise HTTPInstanceConflict(owner) from exc
+        metadata = {
+            "state": "STARTING",
+            "generation": self.generation,
+            "pid": self.pid,
+            "host": self.host,
+            "port": self.port,
+            "workspace": str(self.workspace),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        temporary = self.metadata_path.with_name(self.metadata_path.name + f".{self.pid}.tmp")
+        temporary.write_text(json.dumps(metadata, ensure_ascii=True, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, self.metadata_path)
+
+    def mark_ready(self, runtime: "Runtime") -> None:
+        payload = {
+            "state": "READY",
+            "generation": self.generation,
+            "pid": self.pid,
+            "host": self.host,
+            "port": self.port,
+            "workspace": str(self.workspace),
+            "server_instance_id": runtime.server_instance_id,
+            "catalog_version": runtime.catalog_version,
+            "tool_count": len(runtime.exposed_tool_names()),
+            "started_at": runtime.started_at,
+        }
+        temporary = self.metadata_path.with_name(self.metadata_path.name + f".{self.pid}.tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=True, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, self.metadata_path)
+
+    def release(self) -> None:
+        if self._stream is None:
+            return
+        try:
+            owner = self._read_owner()
+            if owner.get("generation") == self.generation:
+                try:
+                    self.metadata_path.unlink()
+                except FileNotFoundError:
+                    pass
+            self._unlock()
+        finally:
+            self._stream.close()
+            self._stream = None
 SHELL_CONTROL_TOKENS = {"|", "||", "&", "&&", ";", "(", ")"}
 REDIRECTION_TOKENS = {">", ">>", "<", "<>", ">&", "<&", "&>", "&>>"}
 HEREDOC_TOKENS = {"<<", "<<<"}
@@ -215,6 +360,10 @@ PATH_ARGUMENT_COMMANDS = {
     "chmod",
     "chown",
     "cp",
+    "copy",
+    "del",
+    "dir",
+    "erase",
     "head",
     "less",
     "ln",
@@ -222,15 +371,41 @@ PATH_ARGUMENT_COMMANDS = {
     "mkdir",
     "more",
     "mv",
+    "move",
+    "pushd",
+    "rd",
+    "ren",
+    "rename",
     "rm",
     "rmdir",
+    "robocopy",
     "stat",
     "tail",
     "touch",
+    "type",
     "wc",
+    "xcopy",
 }
-PATTERN_THEN_PATH_COMMANDS = {"grep", "egrep", "fgrep", "rg", "sed", "awk"}
+PATTERN_THEN_PATH_COMMANDS = {"grep", "egrep", "fgrep", "rg", "sed", "awk", "findstr"}
 SCRIPT_COMMANDS = {"bash", "sh", "zsh", "python", "python3", "node", "ruby", "perl"}
+WINDOWS_COMMAND_SHELLS = {"cmd", "cmd.exe", "command", "command.com"}
+WINDOWS_COMMAND_TOKEN_RE = re.compile(
+    r"(?:^|/)(?P<name>cmd(?:\.exe)?|command(?:\.com)?)(?P<options>(?:/[^/]*)*)$",
+    re.I,
+)
+WINDOWS_COMMAND_WRAPPERS = {"call", "for", "forfiles", "if", "start"}
+WINDOWS_SCRIPT_HOSTS = {
+    "cscript",
+    "cscript.exe",
+    "mshta",
+    "mshta.exe",
+    "powershell",
+    "powershell.exe",
+    "pwsh",
+    "pwsh.exe",
+    "wscript",
+    "wscript.exe",
+}
 ENV_OPTIONS_WITH_ARGUMENT = {
     "-u",
     "--unset",
@@ -336,7 +511,9 @@ class RuntimePolicy:
     permission_mode: str
     shell_env_policy: ShellEnvPolicy
     allow_network: bool
+    outside_read_policy: str
     fake_readonly_annotations: bool = False
+    allow_any_local_path: bool = False
 
 
 OAUTH_TOKEN_AUTH_METHODS = ("client_secret_basic", "client_secret_post", "none")
@@ -492,6 +669,29 @@ def shell_env_policy_from_args(args: argparse.Namespace) -> ShellEnvPolicy:
     )
 
 
+def read_roots_from_args(args: argparse.Namespace) -> list[Path]:
+    configured = [
+        str(item).strip()
+        for item in (getattr(args, "read_root", None) or [])
+        if str(item).strip()
+    ]
+    env_value = os.environ.get(f"{ENV_PREFIX}_READ_ROOTS") or ""
+    configured.extend(item.strip() for item in env_value.split(os.pathsep) if item.strip())
+    return [Path(item) for item in configured]
+
+
+def outside_read_policy_from_args(args: argparse.Namespace) -> str:
+    policy = (
+        getattr(args, "outside_read_policy", None)
+        or os.environ.get(f"{ENV_PREFIX}_OUTSIDE_READ_POLICY")
+        or "deny"
+    ).strip().lower()
+    if policy not in OUTSIDE_READ_POLICY_CHOICES:
+        supported = ", ".join(OUTSIDE_READ_POLICY_CHOICES)
+        raise ValueError(f"outside read policy must be one of: {supported}")
+    return policy
+
+
 def permission_mode_from_args(args: argparse.Namespace) -> str:
     skip_all = bool(getattr(args, "dangerously_skip_all_permissions", False)) or truthy_env(
         os.environ.get(f"{ENV_PREFIX}_DANGEROUSLY_SKIP_ALL_PERMISSIONS")
@@ -519,6 +719,17 @@ def fake_readonly_annotations_from_args(args: argparse.Namespace, permission_mod
     return requested
 
 
+def allow_any_local_path_from_args(args: argparse.Namespace, permission_mode: str) -> bool:
+    requested = bool(getattr(args, "dangerously_allow_any_local_path", False)) or truthy_env(
+        os.environ.get(f"{ENV_PREFIX}_DANGEROUSLY_ALLOW_ANY_LOCAL_PATH")
+    )
+    if requested and permission_mode != "dangerous":
+        raise ValueError(
+            "--dangerously-allow-any-local-path requires --permission-mode dangerous"
+        )
+    return requested
+
+
 def runtime_policy_from_args(args: argparse.Namespace) -> RuntimePolicy:
     permission_mode = permission_mode_from_args(args)
     allow_network = (
@@ -530,7 +741,9 @@ def runtime_policy_from_args(args: argparse.Namespace) -> RuntimePolicy:
         permission_mode=permission_mode,
         shell_env_policy=shell_env_policy_from_args(args),
         allow_network=allow_network,
+        outside_read_policy=outside_read_policy_from_args(args),
         fake_readonly_annotations=fake_readonly_annotations_from_args(args, permission_mode),
+        allow_any_local_path=allow_any_local_path_from_args(args, permission_mode),
     )
 
 
@@ -582,25 +795,25 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     ),
     "read_file": ToolSpec(
         title="Read file",
-        description="Read a UTF-8 text file slice inside the configured workspace.",
+        description="Read a UTF-8 text file slice inside the workspace or an explicitly configured read root.",
         read_only=True,
         idempotent=True,
     ),
     "list_dir": ToolSpec(
         title="List directory",
-        description="List directory entries inside the configured workspace.",
+        description="List directory entries inside the workspace or an explicitly configured read root.",
         read_only=True,
         idempotent=True,
     ),
     "list_files": ToolSpec(
         title="List files",
-        description="List workspace files using glob filters.",
+        description="List files in the workspace or an explicitly configured read root using glob filters.",
         read_only=True,
         idempotent=True,
     ),
     "search_text": ToolSpec(
         title="Search text",
-        description="Search UTF-8 workspace files for text or regex matches.",
+        description="Search UTF-8 files in the workspace or an explicitly configured read root.",
         read_only=True,
         idempotent=True,
     ),
@@ -616,6 +829,7 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         title="Execute command",
         description=(
             "Run a bounded command under runtime policy. Pass workdir explicitly for reconnect-safe paths. "
+            "Set interactive=true to keep a pipe-backed stdin open when tty is unavailable. "
             "A still-running command returns command_id. Example: "
             "{\"cmd\":\"pytest -q\",\"workdir\":\".\",\"yield_time_ms\":30000}. "
             "Retained output is bounded per stream; for very large output redirect to a file "
@@ -688,11 +902,49 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     ),
     "view_image": ToolSpec(
         title="View image",
-        description="Return a workspace image as MCP image content.",
+        description="Return an image from the workspace or an explicitly configured read root.",
         read_only=True,
         idempotent=True,
         content_builder=_image_content,
         gated_by="enable_view_image",
+    ),
+    "computer_screenshot": ToolSpec(
+        title="Computer screenshot",
+        description=(
+            "Capture the current Windows desktop as an MCP image with virtual-screen and cursor metadata. "
+            "Requires explicit Computer Use enablement and trusted/dangerous permission mode."
+        ),
+        read_only=True,
+        content_builder=_image_content,
+        gated_by="enable_computer_use",
+    ),
+    "computer_mouse": ToolSpec(
+        title="Computer mouse",
+        description=(
+            "Move, click, scroll, or drag the Windows mouse on the interactive desktop. "
+            "The Windows UAC secure desktop is intentionally not controllable."
+        ),
+        destructive=True,
+        gated_by="enable_computer_use",
+    ),
+    "computer_keyboard": ToolSpec(
+        title="Computer keyboard",
+        description=(
+            "Type text, press a key, or send a hotkey to the current Windows desktop. "
+            "Typed text is not echoed in tool output and UAC secure-desktop input is intentionally unsupported."
+        ),
+        destructive=True,
+        gated_by="enable_computer_use",
+    ),
+    "computer_launch": ToolSpec(
+        title="Launch desktop app",
+        description=(
+            "Open a workspace-local file or executable using normal Windows shell/double-click semantics. "
+            "Does not request, approve, or bypass UAC elevation."
+        ),
+        destructive=True,
+        open_world=True,
+        gated_by="enable_computer_use",
     ),
 }
 
@@ -1067,9 +1319,12 @@ def process_group_popen_kwargs() -> dict[str, Any]:
     if hasattr(os, "setsid"):
         return {"start_new_session": True}
     if os.name == "nt":
-        creation_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        kwargs = hidden_process_popen_kwargs()
+        creation_flag = int(kwargs.get("creationflags", 0))
+        creation_flag |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         if creation_flag:
-            return {"creationflags": creation_flag}
+            kwargs["creationflags"] = creation_flag
+        return kwargs
     return {}
 
 
@@ -1081,7 +1336,14 @@ class ResolvedPath:
 
 
 class Workspace:
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        read_roots: list[Path] | tuple[Path, ...] = (),
+        outside_read_policy: str = "deny",
+        allow_any_local_path: bool = False,
+    ) -> None:
         self.root = root.expanduser().resolve(strict=True)
         if not self.root.is_dir():
             raise ToolFailure("INVALID_ARGUMENT", "Workspace root must be a directory.", category="validation")
@@ -1092,14 +1354,136 @@ class Workspace:
             pass
         if str(self.root) in unsafe_roots:
             raise ToolFailure("INVALID_ARGUMENT", "Unsafe workspace root rejected.", category="security")
+        if outside_read_policy not in OUTSIDE_READ_POLICY_CHOICES:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                f"Unknown outside read policy: {outside_read_policy}",
+                category="validation",
+                details={"supported": list(OUTSIDE_READ_POLICY_CHOICES)},
+            )
+        self.outside_read_policy = outside_read_policy
+        self.allow_any_local_path = allow_any_local_path
+        configured_read_roots: list[Path] = []
+        for configured_root in read_roots:
+            read_root = configured_root.expanduser().resolve(strict=True)
+            if not read_root.is_dir():
+                raise ToolFailure("INVALID_ARGUMENT", "Read root must be a directory.", category="validation")
+            if read_root == Path(read_root.anchor) or str(read_root) in unsafe_roots:
+                raise ToolFailure("INVALID_ARGUMENT", "Unsafe read root rejected.", category="security")
+            if is_relative_to(read_root, self.root):
+                continue
+            if read_root not in configured_read_roots:
+                configured_read_roots.append(read_root)
+        self.read_roots = tuple(configured_read_roots)
         self.git_path = shutil.which("git")
 
-    def _reject_unsafe_text(self, raw_path: str) -> PurePosixPath:
+    @staticmethod
+    def _is_absolute_path(raw_path: str) -> bool:
+        return (
+            Path(raw_path).is_absolute()
+            or raw_path.startswith("/")
+            or re.match(r"^[A-Za-z]:[\\/]", raw_path) is not None
+        )
+
+    @staticmethod
+    def _validate_path_text(raw_path: str) -> None:
         if not isinstance(raw_path, str) or not raw_path:
             raise ToolFailure("INVALID_ARGUMENT", "Path must be a non-empty string.", category="validation")
         if "\x00" in raw_path:
             raise ToolFailure("INVALID_ARGUMENT", "Path contains a NUL byte.", category="validation")
-        if raw_path.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", raw_path):
+
+    def _unrestricted_absolute_candidate(self, raw_path: str) -> Path:
+        self._validate_path_text(raw_path)
+        if not self._is_absolute_path(raw_path):
+            raise ToolFailure("INVALID_ARGUMENT", "Path must be absolute.", category="validation")
+        if os.name == "nt":
+            normalized = raw_path.replace("/", "\\")
+            if normalized.startswith("\\\\"):
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "UNC and Windows device paths are not allowed.",
+                    category="security",
+                )
+            if re.match(r"^[A-Za-z]:\\", normalized) is None:
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "An absolute local drive path is required.",
+                    category="validation",
+                )
+            if self._windows_drive_type(normalized[:3]) not in {2, 3, 5, 6}:
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "The path must use an available local drive, not a mapped network drive.",
+                    category="security",
+                )
+            if ":" in normalized[2:]:
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "Windows alternate data streams are not allowed.",
+                    category="security",
+                )
+            for component in normalized[3:].split("\\"):
+                if not component:
+                    continue
+                canonical_component = component.rstrip(" .")
+                if canonical_component != component:
+                    raise ToolFailure(
+                        "INVALID_ARGUMENT",
+                        "Windows path components may not end in a space or dot.",
+                        category="security",
+                    )
+                device_base = canonical_component.split(".", 1)[0].upper()
+                if device_base in {"CON", "PRN", "AUX", "NUL"} or re.fullmatch(
+                    r"(?:COM|LPT)[1-9]", device_base
+                ):
+                    raise ToolFailure(
+                        "INVALID_ARGUMENT",
+                        "Windows reserved device names are not allowed.",
+                        category="security",
+                    )
+        return Path(raw_path)
+
+    @staticmethod
+    def _windows_drive_type(root: str) -> int:
+        try:
+            get_drive_type = ctypes.windll.kernel32.GetDriveTypeW
+            get_drive_type.argtypes = [ctypes.c_wchar_p]
+            get_drive_type.restype = ctypes.c_uint
+            return int(get_drive_type(root))
+        except (AttributeError, OSError) as exc:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "Windows local-drive identity could not be verified.",
+                category="security",
+            ) from exc
+
+    def _validate_unrestricted_resolved(self, resolved: Path) -> Path:
+        # Revalidate the canonical target so a local-looking junction cannot
+        # redirect unrestricted access to a UNC or mapped-network location.
+        self._unrestricted_absolute_candidate(str(resolved))
+        return resolved
+
+    def read_access_root(self, path: Path) -> Path | None:
+        if is_relative_to(path, self.root):
+            return self.root
+        if self.allow_any_local_path:
+            try:
+                resolved = path.resolve(strict=True)
+                self._validate_unrestricted_resolved(resolved)
+            except (OSError, ToolFailure):
+                return None
+            return resolved if resolved.is_dir() else resolved.parent
+        matches = [root for root in self.read_roots if is_relative_to(path, root)]
+        return max(matches, key=lambda item: len(item.parts), default=None)
+
+    def display_read_path(self, path: Path) -> str:
+        if is_relative_to(path, self.root):
+            return normalize_rel_display(path, self.root)
+        return str(path)
+
+    def _reject_unsafe_text(self, raw_path: str) -> PurePosixPath:
+        self._validate_path_text(raw_path)
+        if self._is_absolute_path(raw_path):
             raise ToolFailure("ABSOLUTE_PATH_DENIED", "Absolute paths are denied.", category="security")
         pure = PurePosixPath(raw_path)
         if any(part == ".." for part in pure.parts):
@@ -1107,7 +1491,16 @@ class Workspace:
         return pure
 
     def resolve_existing(self, raw_path: str = ".") -> ResolvedPath:
-        pure = self._reject_unsafe_text(raw_path or ".")
+        raw_path = raw_path or "."
+        if self.allow_any_local_path and self._is_absolute_path(raw_path):
+            candidate = self._unrestricted_absolute_candidate(raw_path)
+            try:
+                resolved = candidate.resolve(strict=True)
+            except FileNotFoundError as exc:
+                raise ToolFailure("NOT_FOUND", f"Path not found: {raw_path}", category="not_found") from exc
+            self._validate_unrestricted_resolved(resolved)
+            return ResolvedPath(str(resolved), resolved, True)
+        pure = self._reject_unsafe_text(raw_path)
         candidate = self.root.joinpath(*pure.parts)
         try:
             resolved = candidate.resolve(strict=True)
@@ -1118,16 +1511,63 @@ class Workspace:
             raise ToolFailure(code, "Path escapes the configured workspace.", category="security")
         return ResolvedPath(normalize_rel_display(resolved, self.root), resolved, True)
 
+    def resolve_for_read(self, raw_path: str = ".") -> ResolvedPath:
+        self._validate_path_text(raw_path)
+        is_absolute = self._is_absolute_path(raw_path)
+        if not is_absolute:
+            return self.resolve_existing(raw_path)
+        candidate = (
+            self._unrestricted_absolute_candidate(raw_path)
+            if self.allow_any_local_path
+            else Path(raw_path)
+        )
+        try:
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise ToolFailure("NOT_FOUND", f"Path not found: {raw_path}", category="not_found") from exc
+        if self.allow_any_local_path:
+            self._validate_unrestricted_resolved(resolved)
+        if not self.allow_any_local_path and self.read_access_root(resolved) is None:
+            if self.outside_read_policy == "request":
+                raise ToolFailure(
+                    "PERMISSION_REQUIRED",
+                    "Read access is outside the configured roots and requires explicit user approval.",
+                    category="permission",
+                    retryable=True,
+                    details={
+                        "permission": "filesystem_read",
+                        "requested_path": raw_path,
+                        "access": "read_only",
+                        "approval": "Ask the user before an operator adds an approved --read-root and restarts the server.",
+                    },
+                )
+            raise ToolFailure(
+                "ABSOLUTE_PATH_DENIED",
+                "Absolute path is outside the configured workspace and read roots.",
+                category="security",
+            )
+        return ResolvedPath(self.display_read_path(resolved), resolved, True)
+
     def resolve_for_write(self, raw_path: str) -> ResolvedPath:
-        pure = self._reject_unsafe_text(raw_path)
-        if pure.name in {"", ".", ".."}:
+        absolute = self._is_absolute_path(raw_path)
+        if absolute and self.allow_any_local_path:
+            candidate = self._unrestricted_absolute_candidate(raw_path)
+            display = str
+        else:
+            pure = self._reject_unsafe_text(raw_path)
+            candidate = self.root.joinpath(*pure.parts)
+
+            def display(path: Path) -> str:
+                return normalize_rel_display(path, self.root)
+        if candidate.name in {"", ".", ".."}:
             raise ToolFailure("INVALID_ARGUMENT", "Invalid write target.", category="validation")
-        candidate = self.root.joinpath(*pure.parts)
         if candidate.exists() or candidate.is_symlink():
             resolved = candidate.resolve(strict=True)
-            if not is_relative_to(resolved, self.root):
+            if absolute and self.allow_any_local_path:
+                self._validate_unrestricted_resolved(resolved)
+            if not absolute and not is_relative_to(resolved, self.root):
                 raise ToolFailure("SYMLINK_ESCAPE", "Path escapes the configured workspace.", category="security")
-            return ResolvedPath(normalize_rel_display(resolved, self.root), resolved, True)
+            return ResolvedPath(display(resolved), resolved, True)
 
         parent = candidate.parent
         missing: list[Path] = []
@@ -1140,14 +1580,19 @@ class Workspace:
             resolved_parent = parent.resolve(strict=True)
         except FileNotFoundError as exc:
             raise ToolFailure("NOT_FOUND", f"Parent directory not found: {raw_path}", category="not_found") from exc
-        if not is_relative_to(resolved_parent, self.root):
+        if absolute and self.allow_any_local_path:
+            self._validate_unrestricted_resolved(resolved_parent)
+        if not absolute and not is_relative_to(resolved_parent, self.root):
             raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Path escapes the configured workspace.", category="security")
         target = resolved_parent.joinpath(*reversed([p.name for p in missing]), candidate.name)
-        return ResolvedPath(normalize_rel_display(target, self.root), target, False)
+        return ResolvedPath(display(target), target, False)
 
     def reject_write_symlink(self, raw_path: str) -> None:
-        pure = self._reject_unsafe_text(raw_path)
-        candidate = self.root.joinpath(*pure.parts)
+        if self.allow_any_local_path and self._is_absolute_path(raw_path):
+            candidate = self._unrestricted_absolute_candidate(raw_path)
+        else:
+            pure = self._reject_unsafe_text(raw_path)
+            candidate = self.root.joinpath(*pure.parts)
         if candidate.is_symlink():
             raise ToolFailure("SYMLINK_ESCAPE", "Writing through symlinks is denied.", category="security")
 
@@ -1155,12 +1600,14 @@ class Workspace:
         self,
         path: Path,
         *,
+        access_root: Path | None = None,
         include_hidden: bool = False,
         include_ignored: bool = False,
         git_ignored: set[str] | None = None,
     ) -> bool:
+        root = access_root or self.root
         try:
-            rel = path.relative_to(self.root)
+            rel = path.relative_to(root)
         except ValueError:
             return True
         parts = rel.parts
@@ -1171,19 +1618,23 @@ class Workspace:
         if include_ignored:
             return False
         rel_text = rel.as_posix()
-        if rel_text in (git_ignored if git_ignored is not None else self.git_ignored_paths([rel_text])):
+        if rel_text in (
+            git_ignored if git_ignored is not None else self.git_ignored_paths([rel_text], access_root=root)
+        ):
             return True
         return False
 
-    def is_safe_existing_path(self, path: Path) -> bool:
+    def is_safe_existing_path(self, path: Path, *, access_root: Path | None = None) -> bool:
         try:
             resolved = path.resolve(strict=True)
-        except FileNotFoundError:
+        except OSError:
             return False
-        return is_relative_to(resolved, self.root)
+        return is_relative_to(resolved, access_root or self.root)
 
-    def git_ignored_paths(self, rel_paths: list[str]) -> set[str]:
+    def git_ignored_paths(self, rel_paths: list[str], *, access_root: Path | None = None) -> set[str]:
         if not rel_paths:
+            return set()
+        if access_root is not None and access_root != self.root:
             return set()
         git = self.git_path
         if not git:
@@ -1196,6 +1647,7 @@ class Workspace:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 timeout=2,
+                **hidden_process_popen_kwargs(),
             )
         except (OSError, subprocess.SubprocessError):
             return set()
@@ -1251,9 +1703,11 @@ class WorkspaceCommandManager:
                 return
             self.closed = True
             commands = list(self.commands.values())
+            commands.extend(self.output_commands.values())
             self.commands.clear()
             self.output_commands.clear()
         for command in commands:
+            command.close_stdin()
             command.refresh_status()
             if command.process.poll() is None:
                 terminate_process_group(command.process, signal.SIGTERM)
@@ -1268,7 +1722,10 @@ class Runtime:
         self,
         workspace: Path,
         *,
+        read_roots: list[Path] | tuple[Path, ...] = (),
+        outside_read_policy: str = "deny",
         enable_view_image: bool = True,
+        enable_computer_use: bool = False,
         permission_mode: str = "safe",
         shell_env_policy: ShellEnvPolicy | None = None,
         allow_network: bool = False,
@@ -1276,17 +1733,51 @@ class Runtime:
         oauth_config: OAuthConfig | None = None,
         project_context: ProjectContext | None = None,
         fake_readonly_annotations: bool = False,
+        allow_any_local_path: bool = False,
         transport: str = "stdio",
         command_manager: WorkspaceCommandManager | None = None,
     ) -> None:
-        self.workspace = Workspace(workspace)
+        if allow_any_local_path and permission_mode != "dangerous":
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "allow_any_local_path requires permission_mode=dangerous.",
+                category="validation",
+            )
+        if allow_any_local_path and transport != "http":
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "allow_any_local_path is available only over authenticated HTTP.",
+                category="security",
+            )
+        if allow_any_local_path and not (auth_token or oauth_config):
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "allow_any_local_path requires bearer or OAuth authentication.",
+                category="security",
+            )
+        self.workspace = Workspace(
+            workspace,
+            read_roots=read_roots,
+            outside_read_policy=outside_read_policy,
+            allow_any_local_path=allow_any_local_path,
+        )
         self.enable_view_image = enable_view_image
+        self.enable_computer_use = enable_computer_use
         self._exposed_tool_names = [
             name
             for name, spec in TOOL_REGISTRY.items()
             if spec.gated_by is None or getattr(self, spec.gated_by)
         ]
         self._exposed_tool_name_set = frozenset(self._exposed_tool_names)
+        self.catalog_version = hashlib.sha256(
+            json.dumps(
+                [tool_definition(name, fake_readonly=False) for name in self._exposed_tool_names],
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+        self.started_at = datetime.now(timezone.utc).isoformat()
         if permission_mode not in PERMISSION_MODE_CHOICES:
             raise ToolFailure(
                 "INVALID_ARGUMENT",
@@ -1295,6 +1786,7 @@ class Runtime:
                 details={"supported": list(PERMISSION_MODE_CHOICES)},
             )
         self.permission_mode = permission_mode
+        self.transport = transport
         self.capabilities = PERMISSION_MODE_CAPABILITIES[permission_mode]
         self.dangerously_skip_all_permissions = self.capabilities.skip_all_permissions
         # Faking annotations is only defensible where the caller has already
@@ -1336,6 +1828,7 @@ class Runtime:
         self.patch_baselines: dict[str, str | None] = {}
         self.patch_lock = threading.Lock()
         self.patch_committer = AtomicPatchCommitter()
+        self.mutation_receipt_lock = threading.Lock()
         # ProjectContext is frozen and derived only from the workspace tree, so
         # an embedder that builds several runtimes over one workspace can reuse
         # the discovery (git ls-files / directory walk) result.
@@ -1484,8 +1977,26 @@ class Runtime:
             "protocolVersion": protocol_version,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": self.server_identity(),
-            "instructions": self.project_context.server_instructions(),
+            "instructions": self.server_instructions(),
         }
+
+    def server_instructions(self) -> str:
+        instructions = self.project_context.server_instructions()
+        if self.workspace.read_roots:
+            roots = "\n".join(f"- {root}" for root in self.workspace.read_roots)
+            instructions += (
+                "\n\nRead-only paths outside the workspace are available to read_file, list_dir, list_files, "
+                "search_text, and view_image. Use absolute paths under these configured roots:\n"
+                f"{roots}"
+            )
+        if self.workspace.outside_read_policy == "request":
+            instructions += (
+                "\n\nIf a direct read returns PERMISSION_REQUIRED for filesystem_read, ask the user for "
+                "explicit approval. Do not retry, widen a root, or claim access before an operator adds the "
+                "approved --read-root and restarts the server. request_permissions records the manual request; "
+                "it does not grant access."
+            )
+        return instructions
 
     def discover_payload(self) -> dict[str, Any]:
         """Tell a client that never handshakes what this server can do.
@@ -1501,7 +2012,7 @@ class Runtime:
         return {
             "supportedVersions": list(MODERN_PROTOCOL_VERSIONS),
             "capabilities": {"tools": {"listChanged": False}},
-            "instructions": self.project_context.server_instructions(),
+            "instructions": self.server_instructions(),
         }
 
     def server_identity(self) -> dict[str, Any]:
@@ -1548,16 +2059,100 @@ class Runtime:
     def _exec_environment_summary(self) -> dict[str, Any]:
         return {
             "workspace": str(self.workspace.root),
+            "read_roots": [str(root) for root in self.workspace.read_roots],
+            "outside_read_policy": self.workspace.outside_read_policy,
+            "filesystem_scope": (
+                "all_local_drives" if self.workspace.allow_any_local_path else "workspace_and_read_roots"
+            ),
             "permission_mode": self.permission_mode,
             "network_allowed": self.allow_network,
             "runtime_dir": str(self.runtime_dir),
             "home": str(self.command_home_dir()),
             "tmpdir": str(self.command_tmp_dir()),
             "cache_dir": str(self.cache_dir),
+            "mutation_receipt_file": str(self._mutation_receipt_file()),
         }
+
+    def _mutation_receipt_file(self) -> Path:
+        """Durable local evidence for calls whose upstream response may be lost."""
+        return self.workspace.root / ".coding-tools-mcp" / "mutation-receipts.jsonl"
+
+    @staticmethod
+    def _mutation_args_hash(name: str, args: dict[str, Any]) -> str:
+        encoded = json.dumps(
+            {"tool": name, "arguments": args},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _append_mutation_receipt(
+        self,
+        *,
+        receipt_id: str,
+        phase: str,
+        tool: str,
+        args_hash: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Append a bounded receipt without ever making the tool itself fail."""
+        path = self._mutation_receipt_file()
+        event: dict[str, Any] = {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "receipt_id": receipt_id,
+            "phase": phase,
+            "tool": tool,
+            "args_sha256": args_hash,
+            "server_instance_id": self.server_instance_id,
+        }
+        if payload is not None:
+            error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+            affected = payload.get("affected_files")
+            event.update(
+                {
+                    "ok": bool(payload.get("ok")),
+                    "status": payload.get("status"),
+                    "error_code": error.get("code"),
+                    "command_id": payload.get("command_id"),
+                    "affected_files": [
+                        item.get("path")
+                        for item in affected
+                        if isinstance(item, dict) and isinstance(item.get("path"), str)
+                    ]
+                    if isinstance(affected, list)
+                    else None,
+                }
+            )
+        try:
+            with self.mutation_receipt_lock:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    if path.stat().st_size >= MUTATION_RECEIPT_MAX_BYTES:
+                        rotated = path.with_name(path.name + ".1")
+                        if rotated.exists():
+                            rotated.unlink()
+                        os.replace(path, rotated)
+                except FileNotFoundError:
+                    pass
+                with path.open("a", encoding="utf-8", newline="\n") as stream:
+                    stream.write(json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+        except OSError:
+            # Evidence must be best effort; a full/read-only disk cannot turn a
+            # valid user operation into an unrelated MCP failure.
+            return
 
     def _landlock_enforced(self, landlock: dict[str, Any]) -> bool:
         return bool(landlock.get("available")) and self.landlock_enabled()
+
+    def _bounded_sync_wait_ms(self, requested_ms: int) -> int:
+        requested = max(0, requested_ms)
+        if self.transport == "http":
+            return min(requested, HTTP_SYNC_WAIT_CAP_MS)
+        return requested
 
     def server_info_payload(self) -> dict[str, Any]:
         tools = self.exposed_tool_names()
@@ -1567,10 +2162,15 @@ class Runtime:
             "server": SERVER_NAME,
             "title": SERVER_TITLE,
             "version": __version__,
+            "server_instance_id": self.server_instance_id,
+            "started_at": self.started_at,
+            "pid": os.getpid(),
+            "catalog_version": self.catalog_version,
             "supported_protocol_versions": list(KNOWN_PROTOCOL_VERSIONS),
             **self._exec_environment_summary(),
             "auth_enabled": self.auth_enabled(),
             "dangerously_skip_all_permissions": self.dangerously_skip_all_permissions,
+            "dangerously_allow_any_local_path": self.workspace.allow_any_local_path,
             "annotation_override": "fake_readonly" if self.fake_readonly_annotations else None,
             "landlock": landlock,
             "exec_policy": {
@@ -1578,6 +2178,13 @@ class Runtime:
                 "inline_script": self.inline_script_policy(),
                 "global_tmp_write": self.global_tmp_write_policy(),
                 "secret_env_filter": self.secret_env_filter_policy(),
+                "computer_control": "allowed" if self.capabilities.computer_control else "blocked",
+            },
+            "computer_use": {
+                "enabled": self.enable_computer_use,
+                "platform": os.name,
+                "secure_desktop_control": False,
+                "uac_elevation": "not_supported",
             },
             "shell_env_inherit": self.shell_env_policy.inherit,
             "shell_env_include_only": list(self.shell_env_policy.include_only),
@@ -1613,9 +2220,33 @@ class Runtime:
             raise JsonRpcError(-32602, f"Unknown tool: {name}", {"reason": "unknown_tool"})
         spec = TOOL_REGISTRY[name]
         validate_arguments(name, args)
+        receipt_id: str | None = None
+        receipt_hash: str | None = None
+        if name in MUTATING_TOOL_NAMES:
+            receipt_id = secrets.token_urlsafe(12)
+            receipt_hash = self._mutation_args_hash(name, args)
+            self._append_mutation_receipt(
+                receipt_id=receipt_id,
+                phase="started",
+                tool=name,
+                args_hash=receipt_hash,
+            )
         try:
             payload = handler(args)
             payload.setdefault("ok", True)
+            if receipt_id is not None and receipt_hash is not None:
+                payload["mutation_receipt"] = {
+                    "receipt_id": receipt_id,
+                    "args_sha256": receipt_hash,
+                    "path": str(self._mutation_receipt_file()),
+                }
+                self._append_mutation_receipt(
+                    receipt_id=receipt_id,
+                    phase="finished",
+                    tool=name,
+                    args_hash=receipt_hash,
+                    payload=payload,
+                )
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             content = spec.content_builder(payload) if spec.content_builder else None
             return make_tool_result(name, payload, is_error=payload.get("ok") is False, content=content)
@@ -1645,6 +2276,19 @@ class Runtime:
                 }
             if exc.code == "ELICITATION_UNSUPPORTED":
                 payload["status"] = "unsupported"
+            if receipt_id is not None and receipt_hash is not None:
+                payload["mutation_receipt"] = {
+                    "receipt_id": receipt_id,
+                    "args_sha256": receipt_hash,
+                    "path": str(self._mutation_receipt_file()),
+                }
+                self._append_mutation_receipt(
+                    receipt_id=receipt_id,
+                    phase="finished",
+                    tool=name,
+                    args_hash=receipt_hash,
+                    payload=payload,
+                )
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
         except Exception as exc:  # noqa: BLE001 - tool failures must stay structured
@@ -1660,6 +2304,19 @@ class Runtime:
             }
             if spec.error_status:
                 payload["status"] = spec.error_status
+            if receipt_id is not None and receipt_hash is not None:
+                payload["mutation_receipt"] = {
+                    "receipt_id": receipt_id,
+                    "args_sha256": receipt_hash,
+                    "path": str(self._mutation_receipt_file()),
+                }
+                self._append_mutation_receipt(
+                    receipt_id=receipt_id,
+                    phase="finished",
+                    tool=name,
+                    args_hash=receipt_hash,
+                    payload=payload,
+                )
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
 
@@ -1710,6 +2367,10 @@ class Runtime:
         )
         if os.environ.get(f"{ENV_PREFIX}_TRACE") != "1":
             return
+        trace_args = args
+        if name == "computer_keyboard" and "text" in args:
+            trace_args = dict(args)
+            trace_args["text"] = f"<redacted:{len(str(args.get('text', '')))} chars>"
         event = {
             "event": "tool_call",
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
@@ -1720,13 +2381,13 @@ class Runtime:
             "duration_ms": duration_ms,
             "command_id": payload.get("command_id"),
             "truncated": payload.get("truncated"),
-            "args": redact_for_trace(args),
+            "args": redact_for_trace(trace_args),
         }
         print(json.dumps(event, sort_keys=True, separators=(",", ":")), file=sys.stderr, flush=True)
 
     def read_file(self, args: dict[str, Any]) -> dict[str, Any]:
         requested_path = str(args.get("path", ""))
-        resolved = self.resolve_existing(requested_path)
+        resolved = self.workspace.resolve_for_read(requested_path)
         if resolved.path.is_dir():
             raise ToolFailure("IS_DIRECTORY", "Path is a directory.", category="validation")
         max_bytes = int(args.get("max_bytes", 131072))
@@ -1814,9 +2475,11 @@ class Runtime:
         return result
 
     def list_dir(self, args: dict[str, Any]) -> dict[str, Any]:
-        resolved = self.resolve_existing(str(args.get("path", ".")))
+        resolved = self.workspace.resolve_for_read(str(args.get("path", ".")))
         if not resolved.path.is_dir():
             raise ToolFailure("NOT_A_DIRECTORY", "Path is not a directory.", category="validation")
+        access_root = self.workspace.read_access_root(resolved.path)
+        assert access_root is not None
         recursive = bool(args.get("recursive", False))
         max_depth = int(args.get("max_depth", 1))
         max_entries = int(args.get("max_entries", 1000))
@@ -1834,17 +2497,26 @@ class Runtime:
                 children = list(directory.iterdir())
             except OSError:
                 return
-            child_rel_paths = [normalize_rel_display(child, self.workspace.root) for child in children]
-            ignored = set() if include_ignored else self.workspace.git_ignored_paths(child_rel_paths)
+            child_rel_paths = [normalize_rel_display(child, access_root) for child in children]
+            ignored = (
+                set()
+                if include_ignored
+                else self.workspace.git_ignored_paths(child_rel_paths, access_root=access_root)
+            )
             for child in children:
+                if not self.workspace.is_safe_existing_path(child, access_root=access_root):
+                    continue
                 if self.workspace.is_ignored_path(
                     child,
+                    access_root=access_root,
                     include_hidden=include_hidden,
                     include_ignored=include_ignored,
                     git_ignored=ignored,
                 ):
                     continue
-                entries.append(entry_for_path(child, self.workspace.root))
+                item = entry_for_path(child, access_root)
+                item["path"] = self.workspace.display_read_path(child)
+                entries.append(item)
                 if len(entries) >= max_entries:
                     truncated = True
                     return
@@ -1861,9 +2533,11 @@ class Runtime:
         }
 
     def list_files(self, args: dict[str, Any]) -> dict[str, Any]:
-        resolved = self.resolve_existing(str(args.get("path", ".")))
+        resolved = self.workspace.resolve_for_read(str(args.get("path", ".")))
         if not resolved.path.is_dir():
             raise ToolFailure("NOT_A_DIRECTORY", "Path is not a directory.", category="validation")
+        access_root = self.workspace.read_access_root(resolved.path)
+        assert access_root is not None
         patterns_arg = args.get("patterns")
         glob_arg = args.get("glob")
         if isinstance(patterns_arg, list) and patterns_arg:
@@ -1889,25 +2563,30 @@ class Runtime:
             return fast_result
         files: list[dict[str, Any]] = []
         truncated = False
-        for batch in path_batches(walk_files(resolved.path), 256):
+        for batch in path_batches(walk_files(resolved.path, access_root=access_root), 256):
             # Filter by glob first so git check-ignore only sees candidates.
             candidates = [
                 (path, rel)
-                for path, rel in ((path, normalize_rel_display(path, self.workspace.root)) for path in batch)
+                for path, rel in ((path, normalize_rel_display(path, access_root)) for path in batch)
                 if matches_any_glob(rel, patterns) and not matches_any_glob(rel, exclude_patterns)
             ]
-            ignored = set() if include_ignored else self.workspace.git_ignored_paths([rel for _, rel in candidates])
+            ignored = (
+                set()
+                if include_ignored
+                else self.workspace.git_ignored_paths([rel for _, rel in candidates], access_root=access_root)
+            )
             for path, rel in candidates:
-                if path.is_symlink() and not self.workspace.is_safe_existing_path(path):
+                if not self.workspace.is_safe_existing_path(path, access_root=access_root):
                     continue
                 if self.workspace.is_ignored_path(
                     path,
+                    access_root=access_root,
                     include_hidden=include_hidden,
                     include_ignored=include_ignored,
                     git_ignored=ignored,
                 ):
                     continue
-                files.append(file_entry(path, rel, path.lstat()))
+                files.append(file_entry(path, self.workspace.display_read_path(path), path.lstat()))
                 if len(files) >= max_results:
                     truncated = True
                     break
@@ -1935,6 +2614,9 @@ class Runtime:
         fd = cached_which("fd", "fdfind")
         if not fd or not resolved.path.is_dir():
             return None
+        access_root = self.workspace.read_access_root(resolved.path)
+        if access_root is None:
+            return None
         args_base = [
             fd,
             "--glob",
@@ -1957,7 +2639,7 @@ class Runtime:
         for pattern in exclude_patterns:
             args_base.extend(["--exclude", pattern])
 
-        paths: dict[str, Path] = {}
+        paths: dict[str, tuple[Path, str]] = {}
         for pattern in patterns:
             effective = pattern
             args = list(args_base)
@@ -1974,6 +2656,7 @@ class Runtime:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     timeout=10,
+                    **hidden_process_popen_kwargs(),
                 )
             except Exception:
                 return None
@@ -1984,21 +2667,26 @@ class Runtime:
                 if not rel_to_search:
                     continue
                 path = resolved.path / rel_to_search
-                if path.is_symlink() and not self.workspace.is_safe_existing_path(path):
+                if not self.workspace.is_safe_existing_path(path, access_root=access_root):
                     continue
-                rel = normalize_rel_display(path, self.workspace.root)
+                rel = normalize_rel_display(path, access_root)
                 if matches_any_glob(rel, exclude_patterns):
                     continue
-                paths[rel] = path
+                paths[self.workspace.display_read_path(path)] = (path, rel)
                 if len(paths) >= max_results:
                     break
             if len(paths) >= max_results:
                 break
-        ignored = set() if include_ignored else self.workspace.git_ignored_paths(list(paths))
+        ignored = (
+            set()
+            if include_ignored
+            else self.workspace.git_ignored_paths([rel for _, rel in paths.values()], access_root=access_root)
+        )
         files: list[dict[str, Any]] = []
-        for rel, path in paths.items():
+        for display, (path, rel) in paths.items():
             if self.workspace.is_ignored_path(
                 path,
+                access_root=access_root,
                 include_hidden=include_hidden,
                 include_ignored=include_ignored,
                 git_ignored=ignored,
@@ -2008,7 +2696,7 @@ class Runtime:
                 stat = path.lstat()
             except OSError:
                 continue
-            files.append(file_entry(path, rel, stat))
+            files.append(file_entry(path, display, stat))
         files.sort(key=lambda item: item["modified"] if sort_key == "modified" else item["path"])
         truncated = len(paths) >= max_results
         return {
@@ -2023,7 +2711,7 @@ class Runtime:
         query = str(args.get("query", ""))
         if not query:
             raise ToolFailure("INVALID_ARGUMENT", "query is required.", category="validation")
-        resolved = self.resolve_existing(str(args.get("path", ".")))
+        resolved = self.workspace.resolve_for_read(str(args.get("path", ".")))
         regex = bool(args.get("regex", False))
         case_sensitive = bool(args.get("case_sensitive", False))
         include_globs = [str(item) for item in args.get("include_globs", [])]
@@ -2046,6 +2734,8 @@ class Runtime:
         )
         if fast_result is not None:
             return fast_result
+        access_root = self.workspace.read_access_root(resolved.path)
+        assert access_root is not None
         matches: list[dict[str, Any]] = []
         total = 0
         flags = 0 if case_sensitive else re.IGNORECASE
@@ -2055,7 +2745,7 @@ class Runtime:
             raise ToolFailure("INVALID_ARGUMENT", f"Invalid regex: {exc}", category="validation") from exc
         needle = query if case_sensitive else query.lower()
 
-        roots = [resolved.path] if resolved.path.is_file() else walk_files(resolved.path)
+        roots = [resolved.path] if resolved.path.is_file() else walk_files(resolved.path, access_root=access_root)
         for batch in path_batches(roots, 256):
             # Filter by glob first so git check-ignore runs once per batch of
             # candidates instead of once per walked file.
@@ -2063,17 +2753,17 @@ class Runtime:
             for path in batch:
                 if path.is_dir():
                     continue
-                if path.is_symlink() and not self.workspace.is_safe_existing_path(path):
+                if not self.workspace.is_safe_existing_path(path, access_root=access_root):
                     continue
-                rel = normalize_rel_display(path, self.workspace.root)
+                rel = normalize_rel_display(path, access_root)
                 if include_globs and not matches_any_glob(rel, include_globs):
                     continue
                 if matches_any_glob(rel, exclude_globs):
                     continue
                 candidates.append((path, rel))
-            ignored = self.workspace.git_ignored_paths([rel for _, rel in candidates])
+            ignored = self.workspace.git_ignored_paths([rel for _, rel in candidates], access_root=access_root)
             for path, rel in candidates:
-                if self.workspace.is_ignored_path(path, git_ignored=ignored):
+                if self.workspace.is_ignored_path(path, access_root=access_root, git_ignored=ignored):
                     continue
                 try:
                     data = path.read_bytes()
@@ -2101,7 +2791,17 @@ class Runtime:
                         continue
                     before = lines[max(0, index - context_lines) : index]
                     after = lines[index + 1 : index + 1 + context_lines]
-                    matches.append(search_match_item(rel, index + 1, column, line, before, after, max_preview_bytes))
+                    matches.append(
+                        search_match_item(
+                            self.workspace.display_read_path(path),
+                            index + 1,
+                            column,
+                            line,
+                            before,
+                            after,
+                            max_preview_bytes,
+                        )
+                    )
         return {
             "query": query,
             "matches": matches,
@@ -2137,15 +2837,17 @@ class Runtime:
             args.extend(["--glob", pattern])
         for pattern in exclude_globs:
             args.extend(["--glob", f"!{pattern}"])
-        search_path = resolved.display if resolved.display != "." else "."
+        search_cwd = resolved.path if resolved.path.is_dir() else resolved.path.parent
+        search_path = "." if resolved.path.is_dir() else resolved.path.name
         args.extend(["--", query, search_path])
         try:
             process = subprocess.Popen(
                 args,
-                cwd=str(self.workspace.root),
+                cwd=str(search_cwd),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
+                **hidden_process_popen_kwargs(),
             )
         except OSError:
             return None
@@ -2185,24 +2887,30 @@ class Runtime:
                     truncated = True
                     process.terminate()
                     break
-                rel = normalize_rel_display((self.workspace.root / path_text).resolve(), self.workspace.root)
+                matched_path = (search_cwd / path_text).resolve()
+                access_root = self.workspace.read_access_root(matched_path)
+                if access_root is None:
+                    continue
+                display = self.workspace.display_read_path(matched_path)
                 submatches = data.get("submatches") if isinstance(data.get("submatches"), list) else []
                 first_submatch = submatches[0] if submatches and isinstance(submatches[0], dict) else {}
                 column = int(first_submatch.get("start", 0)) + 1
                 sanitized = str(line_text).replace("\r\n", "\n").replace("\r", "").rstrip("\n")
                 lines: list[str] = []
                 if context_lines > 0:
-                    lines = file_cache.get(rel, [])
-                    if rel not in file_cache:
+                    lines = file_cache.get(display, [])
+                    if display not in file_cache:
                         try:
-                            lines = (self.workspace.root / rel).read_text(encoding="utf-8").splitlines()
+                            lines = matched_path.read_text(encoding="utf-8").splitlines()
                         except OSError:
                             lines = []
-                        file_cache[rel] = lines
+                        file_cache[display] = lines
                 index = line_number - 1
                 before = lines[max(0, index - context_lines) : index] if lines else []
                 after = lines[index + 1 : index + 1 + context_lines] if lines else []
-                matches.append(search_match_item(rel, line_number, column, sanitized, before, after, max_preview_bytes))
+                matches.append(
+                    search_match_item(display, line_number, column, sanitized, before, after, max_preview_bytes)
+                )
         finally:
             timeout.cancel()
             try:
@@ -2240,10 +2948,14 @@ class Runtime:
             removals = 0
             for op in operations:
                 self._validate_patch_path(op.path, require_existing=op.kind in {"update", "delete"})
+                if not dry_run:
+                    self._reject_control_plane_patch_path(op.path)
                 if op.kind in {"add", "update", "delete"}:
                     self.workspace.reject_write_symlink(op.path)
                 if op.move_to:
                     self._validate_patch_path(op.move_to, require_existing=False)
+                    if not dry_run:
+                        self._reject_control_plane_patch_path(op.move_to)
                     self.workspace.reject_write_symlink(op.move_to)
                 if op.kind == "add":
                     target = self.workspace.resolve_for_write(op.path)
@@ -2337,6 +3049,20 @@ class Runtime:
         else:
             self.workspace.resolve_for_write(raw_path)
 
+    def _reject_control_plane_patch_path(self, raw_path: str) -> None:
+        target = self.workspace.resolve_for_write(raw_path).path
+        if is_protected_control_plane_path(target, self.workspace.root):
+            raise ToolFailure(
+                "CONTROL_PLANE_LEASE_REQUIRED",
+                "The production MCP task config may only be changed by the control-plane transaction manager.",
+                category="permission",
+                details={
+                    "permission": "control_plane_transaction",
+                    "path": str(target),
+                    "dangerous_mode_bypassable": False,
+                },
+            )
+
     def _commit_staged_files(self, staged: list[StagedFile]) -> None:
         self.patch_committer.commit(staged)
         for change in staged:
@@ -2359,9 +3085,11 @@ class Runtime:
             raise ToolFailure("NOT_A_DIRECTORY", "workdir is not a directory.", category="validation")
         self._check_command_policy(cmd, args)
         timeout_ms = int(args.get("timeout_ms", 30000))
-        yield_ms = int(args.get("yield_time_ms", 10000))
+        requested_yield_ms = int(args.get("yield_time_ms", 10000))
+        yield_ms = self._bounded_sync_wait_ms(requested_yield_ms)
         max_output_bytes = int(args.get("max_output_bytes", 65536))
         tty = bool(args.get("tty", False))
+        interactive = bool(args.get("interactive", False))
         stdin_text = str(args.get("stdin", ""))
         env = self._command_env(args.get("env", {}))
         start = time.time()
@@ -2414,10 +3142,17 @@ class Runtime:
                 tty=tty,
                 popen_kwargs=popen_extra,
             )
+            sync_wait_warning = None
+            if yield_ms < requested_yield_ms:
+                sync_wait_warning = (
+                    f"HTTP transport caps synchronous command waits at {HTTP_SYNC_WAIT_CAP_MS}ms; "
+                    "the process is still running and should be polled by command_id."
+                )
+            command_warnings = [warning for warning in (landlock_warning, sync_wait_warning) if warning]
             command = self._make_command(
                 process,
                 timeout_at=deadline,
-                warnings=[landlock_warning] if landlock_warning else None,
+                warnings=command_warnings or None,
                 pty_master_fd=pty_master_fd,
             )
             with self.commands_lock:
@@ -2451,7 +3186,7 @@ class Runtime:
             if process.poll() is None:
                 raise
         finally:
-            if not tty:
+            if not tty and not interactive:
                 command.close_stdin()
         initial_wait = max(0, min(yield_ms, 30000)) / 1000.0
 
@@ -2485,6 +3220,18 @@ class Runtime:
             time.sleep(0.02)
 
     def _check_command_policy(self, cmd: str, args: dict[str, Any]) -> None:
+        control_plane_violation = control_plane_command_violation(cmd)
+        if control_plane_violation is not None:
+            raise ToolFailure(
+                control_plane_violation.code,
+                control_plane_violation.message,
+                category="permission",
+                details={
+                    "permission": "control_plane_transaction",
+                    "evidence": control_plane_violation.evidence,
+                    "dangerous_mode_bypassable": False,
+                },
+            )
         if self.dangerously_skip_all_permissions:
             return
         self._check_command_paths(cmd)
@@ -2508,7 +3255,7 @@ class Runtime:
                     details={"permission": INLINE_SCRIPT_PERMISSION, **inline_script},
                 )
         compact = " ".join(cmd.split()).lower()
-        if not self.capabilities.shell_expansion and SHELL_EXPANSION_RE.search(cmd):
+        if not self.capabilities.shell_expansion and command_uses_shell_expansion(cmd):
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
                 "Shell command substitution and parameter expansion require explicit permission.",
@@ -2668,6 +3415,7 @@ class Runtime:
             stderr=subprocess.PIPE,
             timeout=timeout,
             env=self._git_env() if env is None else env,
+            **hidden_process_popen_kwargs(),
         )
 
     def _run_git_bytes(
@@ -2680,6 +3428,7 @@ class Runtime:
             stderr=subprocess.PIPE,
             timeout=timeout,
             env=self._git_env() if env is None else env,
+            **hidden_process_popen_kwargs(),
         )
 
     def _git_status_not_repo(self, completed: subprocess.CompletedProcess[str]) -> dict[str, Any]:
@@ -2727,7 +3476,7 @@ class Runtime:
         pty_master_fd: int | None = None,
     ) -> CommandRun:
         return CommandRun(
-            command_id=secrets.token_urlsafe(18),
+            command_id=f"{self.server_instance_id}.{secrets.token_urlsafe(18)}",
             process=process,
             timeout_at=timeout_at,
             warnings=warnings or [],
@@ -2760,6 +3509,7 @@ class Runtime:
         command.refresh_status()
         if command.process.poll() is None:
             return
+        command.close_stdin()
         with self.commands_lock:
             self.commands.pop(command.command_id, None)
         self._remember_output_command(command)
@@ -2787,6 +3537,7 @@ class Runtime:
         with self.commands_lock:
             command = self.commands.get(command_id) or self.output_commands.get(command_id)
         if command is None:
+            self._raise_if_stale_command_id(command_id)
             raise ToolFailure(
                 "COMMAND_NOT_FOUND",
                 "Output command not found.",
@@ -2794,6 +3545,23 @@ class Runtime:
                 details={"retry_hint": _COMMAND_RECOVERY_HINT},
             )
         return command
+
+    def _raise_if_stale_command_id(self, command_id: str) -> None:
+        command_instance_id, separator, _ = command_id.partition(".")
+        if separator and command_instance_id != self.server_instance_id:
+            raise ToolFailure(
+                "BACKEND_RESTARTED",
+                "The command belongs to an earlier MCP backend instance.",
+                category="runtime",
+                details={
+                    "current_server_instance_id": self.server_instance_id,
+                    "command_server_instance_id": command_instance_id,
+                    "retry_hint": (
+                        "The old process state was released when the backend restarted. "
+                        "Start the work again with exec_command and use its new command_id."
+                    ),
+                },
+            )
 
     def _format_command_output(self, command: CommandRun, payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
         terminal = payload.get("status") != "running"
@@ -2805,7 +3573,7 @@ class Runtime:
                 "arguments": {
                     "command_id": command.command_id,
                     "chars": "",
-                    "yield_time_ms": 10000,
+                    "yield_time_ms": self._bounded_sync_wait_ms(10000),
                 },
             }
         output_refs = {
@@ -2903,7 +3671,7 @@ class Runtime:
         return compact
 
     def _command_output_summary(self, command: CommandRun, payload: dict[str, Any]) -> str:
-        retained = command.retained_output_bytes().decode("utf-8", errors="replace")
+        retained = decode_output_bytes(command.retained_output_bytes())
         lines = retained.splitlines()
         tail = next((line.strip() for line in reversed(lines) if line.strip()), "")
         if len(tail) > 120:
@@ -2971,7 +3739,7 @@ class Runtime:
             "offset": offset,
             "requested_offset": requested_offset,
             "limit": limit,
-            "content": chunk.decode("utf-8", errors="replace"),
+            "content": decode_output_bytes(chunk),
             "next_offset": next_offset,
             "total_retained_bytes": len(tail) + min(head_len, tail_start_offset),
             "head_retained_bytes": head_len,
@@ -3004,7 +3772,9 @@ class Runtime:
             return self._format_command_output(command, payload, args)
         if chars:
             command.write_input(chars.encode("utf-8"))
-        wait_until = time.time() + (int(args.get("yield_time_ms", 10000)) / 1000.0)
+        requested_yield_ms = int(args.get("yield_time_ms", 10000))
+        yield_ms = self._bounded_sync_wait_ms(requested_yield_ms)
+        wait_until = time.time() + (yield_ms / 1000.0)
         first_output_at: float | None = None
         while time.time() < wait_until and command.process.poll() is None:
             time.sleep(0.02)
@@ -3018,6 +3788,12 @@ class Runtime:
                     if time.time() - first_output_at >= 0.05:
                         break
         payload = command.snapshot_since_cursor(int(args.get("max_output_bytes", 65536)))
+        if yield_ms < requested_yield_ms:
+            warnings = list(payload.get("warnings", []))
+            warnings.append(
+                f"HTTP transport caps synchronous polling waits at {HTTP_SYNC_WAIT_CAP_MS}ms; poll again if needed."
+            )
+            payload["warnings"] = warnings
         return self._format_command_output(command, payload, args)
 
     def _wait_for_command_exit(self, command: CommandRun, wait_seconds: float) -> bool:
@@ -3076,6 +3852,7 @@ class Runtime:
         with self.commands_lock:
             command = self.commands.get(command_id) or self.output_commands.get(command_id)
         if command is None:
+            self._raise_if_stale_command_id(command_id)
             raise ToolFailure(
                 "COMMAND_NOT_FOUND",
                 "Command not found; stdin access denied.",
@@ -3410,6 +4187,31 @@ class Runtime:
                     "dangerously-skip-all-permissions is enabled; permission-gated operations are auto-granted"
                 ],
             }
+        if args.get("permission") == "filesystem_read":
+            return {
+                "ok": False,
+                "status": "user_confirmation_required",
+                "grant_id": None,
+                "expires_at": None,
+                "permission_request": {
+                    "tool_name": args.get("tool_name"),
+                    "permission": "filesystem_read",
+                    "reason": args.get("reason"),
+                    "arguments": args.get("arguments", {}),
+                    "scope": args.get("scope", "once"),
+                    "status": "required",
+                },
+                "error": {
+                    "code": "PERMISSION_REQUIRED",
+                    "message": (
+                        "Ask the user for explicit approval. Access remains denied until an operator adds the "
+                        "approved read root to server configuration and restarts the server."
+                    ),
+                    "category": "permission",
+                    "retryable": True,
+                    "details": {"requested": args},
+                },
+            }
         return {
             "ok": False,
             "status": "unsupported",
@@ -3425,7 +4227,7 @@ class Runtime:
         }
 
     def view_image(self, args: dict[str, Any]) -> dict[str, Any]:
-        resolved = self.resolve_existing(str(args.get("path", "")))
+        resolved = self.workspace.resolve_for_read(str(args.get("path", "")))
         max_bytes = int(args.get("max_bytes", 5_242_880))
         max_width = int(args.get("max_width", IMAGE_RESIZE_MAX_DIMENSION))
         max_height = int(args.get("max_height", IMAGE_RESIZE_MAX_DIMENSION))
@@ -3465,14 +4267,196 @@ class Runtime:
         }
         return payload
 
+    def _require_computer_control(self) -> None:
+        if not self.capabilities.computer_control:
+            raise ToolFailure(
+                "PERMISSION_REQUIRED",
+                "Computer Use requires trusted or dangerous permission mode.",
+                category="permission",
+                details={"permission": "computer_control", "permission_mode": self.permission_mode},
+            )
+        if os.name != "nt":
+            raise ToolFailure(
+                "UNSUPPORTED_PLATFORM",
+                "Computer Use currently supports Windows only.",
+                category="validation",
+                details={"platform": os.name},
+            )
 
-def walk_files(root: Path) -> Iterator[Path]:
+    def computer_screenshot(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_computer_control()
+        try:
+            data, metadata = computer_tools.capture_screen_png(
+                all_screens=bool(args.get("all_screens", True)),
+                max_width=int(args.get("max_width", 2000)),
+                max_height=int(args.get("max_height", 2000)),
+                max_bytes=int(args.get("max_bytes", 5_242_880)),
+            )
+        except computer_tools.ComputerUnavailable as exc:
+            raise ToolFailure(
+                "COMPUTER_UNAVAILABLE",
+                str(exc),
+                category="environment",
+                retryable=True,
+            ) from exc
+        return {
+            "mime_type": "image/png",
+            "bytes": len(data),
+            **metadata,
+            "_mcp_image_data": base64.b64encode(data).decode("ascii"),
+        }
+
+    def computer_mouse(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_computer_control()
+        action = str(args.get("action", ""))
+        x = int(args["x"]) if args.get("x") is not None else None
+        y = int(args["y"]) if args.get("y") is not None else None
+        try:
+            if action == "move":
+                if x is None or y is None:
+                    raise ValueError("move requires x and y")
+                computer_tools.move_cursor(x, y)
+            elif action == "click":
+                computer_tools.click_mouse(
+                    x=x,
+                    y=y,
+                    button=str(args.get("button", "left")),
+                    clicks=int(args.get("clicks", 1)),
+                    interval_ms=int(args.get("interval_ms", 100)),
+                )
+            elif action == "scroll":
+                computer_tools.scroll_mouse(
+                    delta=int(args.get("delta", 0)),
+                    x=x,
+                    y=y,
+                )
+            elif action == "drag":
+                if x is None or y is None or args.get("to_x") is None or args.get("to_y") is None:
+                    raise ValueError("drag requires x, y, to_x, and to_y")
+                computer_tools.drag_mouse(
+                    x=x,
+                    y=y,
+                    to_x=int(args["to_x"]),
+                    to_y=int(args["to_y"]),
+                    button=str(args.get("button", "left")),
+                    duration_ms=int(args.get("duration_ms", 300)),
+                )
+            else:
+                raise ValueError(f"Unsupported mouse action: {action}")
+            cursor_x, cursor_y = computer_tools.cursor_position()
+        except ValueError as exc:
+            raise ToolFailure("INVALID_ARGUMENT", str(exc), category="validation") from exc
+        except (OSError, computer_tools.ComputerUnavailable) as exc:
+            raise ToolFailure(
+                "COMPUTER_UNAVAILABLE",
+                str(exc),
+                category="environment",
+                retryable=True,
+            ) from exc
+        return {
+            "action": action,
+            "cursor_x": cursor_x,
+            "cursor_y": cursor_y,
+        }
+
+    def computer_keyboard(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_computer_control()
+        action = str(args.get("action", ""))
+        try:
+            if action == "type":
+                if "text" not in args:
+                    raise ValueError("type requires text")
+                text = str(args.get("text", ""))
+                computer_tools.type_text(text, delay_ms=int(args.get("delay_ms", 0)))
+                return {"action": action, "characters_typed": len(text)}
+            if action == "key":
+                key = str(args.get("key", ""))
+                if not key:
+                    raise ValueError("key requires key")
+                computer_tools.press_key(key)
+                return {"action": action, "key": key.lower()}
+            if action == "hotkey":
+                keys = [str(item) for item in args.get("keys", [])]
+                if not keys:
+                    raise ValueError("hotkey requires keys")
+                normalized = {item.strip().lower() for item in keys}
+                if {"ctrl", "alt"}.issubset(normalized) and {"delete", "del"} & normalized:
+                    raise ValueError("Ctrl+Alt+Delete is a secure-attention sequence and cannot be automated")
+                computer_tools.hotkey(keys)
+                return {"action": action, "keys": [item.lower() for item in keys]}
+            raise ValueError(f"Unsupported keyboard action: {action}")
+        except ValueError as exc:
+            raise ToolFailure("INVALID_ARGUMENT", str(exc), category="validation") from exc
+        except (OSError, computer_tools.ComputerUnavailable) as exc:
+            raise ToolFailure(
+                "COMPUTER_UNAVAILABLE",
+                str(exc),
+                category="environment",
+                retryable=True,
+            ) from exc
+
+    def computer_launch(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_computer_control()
+        target = self.workspace.resolve_existing(str(args.get("path", "")))
+        workdir = self.workspace.resolve_existing(str(args.get("workdir", ".")))
+        if not target.path.is_file():
+            raise ToolFailure("INVALID_ARGUMENT", "path must resolve to a file.", category="validation")
+        if not workdir.path.is_dir():
+            raise ToolFailure("INVALID_ARGUMENT", "workdir must resolve to a directory.", category="validation")
+        arguments = [str(item) for item in args.get("arguments", [])]
+        try:
+            result = computer_tools.launch_gui(
+                target.path,
+                arguments=arguments,
+                cwd=workdir.path,
+                show=str(args.get("show", "normal")),
+            )
+        except ValueError as exc:
+            raise ToolFailure("INVALID_ARGUMENT", str(exc), category="validation") from exc
+        except computer_tools.ComputerUnavailable as exc:
+            message = str(exc)
+            code = "ELEVATION_REQUIRED" if "elevation" in message.lower() else "COMPUTER_UNAVAILABLE"
+            raise ToolFailure(
+                code,
+                message,
+                category="permission" if code == "ELEVATION_REQUIRED" else "environment",
+                retryable=False if code == "ELEVATION_REQUIRED" else True,
+                details={"secure_desktop_control": False} if code == "ELEVATION_REQUIRED" else None,
+            ) from exc
+        wait_ms = int(args.get("wait_ms", 750))
+        if wait_ms:
+            time.sleep(wait_ms / 1000.0)
+        return {
+            **result,
+            "path": target.display,
+            "workdir": workdir.display,
+            "wait_ms": wait_ms,
+        }
+
+
+def path_resolves_within(path: Path, root: Path) -> bool:
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        return False
+    return is_relative_to(resolved, root)
+
+
+def walk_files(root: Path, *, access_root: Path | None = None) -> Iterator[Path]:
     if root.is_file() or root.is_symlink():
         yield root
         return
     for current, dirs, files in os.walk(root, followlinks=False):
-        dirs[:] = [name for name in dirs if name not in DEFAULT_EXCLUDED_NAMES]
         current_path = Path(current)
+        dirs[:] = [
+            name
+            for name in dirs
+            if name not in DEFAULT_EXCLUDED_NAMES
+            and (
+                access_root is None
+                or path_resolves_within(current_path / name, access_root)
+            )
+        ]
         for name in files:
             yield current_path / name
 
@@ -3495,10 +4479,26 @@ def find_literal(line: str, needle: str, case_sensitive: bool) -> int:
     return haystack.find(needle)
 
 
-def shlex_split(command: str) -> list[str]:
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+def shlex_split(command: str, *, platform: str | None = None) -> list[str]:
+    windows = (os.name if platform is None else platform) == "nt"
+    lexer = shlex.shlex(command, posix=not windows, punctuation_chars=True)
     lexer.whitespace_split = True
-    return list(lexer)
+    tokens = list(lexer)
+    if not windows:
+        return tokens
+    return [
+        token[1:-1]
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}
+        else token
+        for token in tokens
+    ]
+
+
+def command_uses_shell_expansion(command: str, *, platform: str | None = None) -> bool:
+    if SHELL_EXPANSION_RE.search(command):
+        return True
+    windows = (os.name if platform is None else platform) == "nt"
+    return windows and WINDOWS_SHELL_EXPANSION_RE.search(command) is not None
 
 
 def parse_heredoc_delimiter(command: str, start: int) -> tuple[int, str, bool]:
@@ -3745,10 +4745,28 @@ def inline_script_command(command: str) -> dict[str, str] | None:
 def inline_script_segment(command: str | None, args: list[str]) -> dict[str, str] | None:
     if not command:
         return None
-    name = PurePosixPath(command.replace("\\", "/")).name.lower()
+    normalized_command = command.lstrip("@").replace("\\", "/")
+    name = PurePosixPath(normalized_command).name.lower()
+    embedded_windows_options = ""
+    windows_command_match = WINDOWS_COMMAND_TOKEN_RE.search(normalized_command)
+    if windows_command_match is not None:
+        name = windows_command_match.group("name").lower()
+        embedded_windows_options = windows_command_match.group("options").lower()
     if name == "env":
         _candidates, wrapped_command, wrapped_args = env_wrapped_command(args)
         return inline_script_segment(wrapped_command, wrapped_args)
+    if name in WINDOWS_SCRIPT_HOSTS:
+        return {"command": name, "option": "windows-script-host"}
+    if os.name == "nt" and name in WINDOWS_COMMAND_WRAPPERS:
+        return {"command": name, "option": "windows-command-wrapper"}
+    if name in WINDOWS_COMMAND_SHELLS:
+        if os.name == "nt":
+            return {"command": name, "option": embedded_windows_options or "windows-command-shell"}
+        for arg in ([embedded_windows_options] if embedded_windows_options else []) + args:
+            option = arg.lower()
+            if option.startswith("/") and re.search(r"(?:^|/)[ck]", option):
+                return {"command": name, "option": option}
+        return None
     if name in {"bash", "sh", "zsh"}:
         for arg in args:
             if arg.startswith("-") and "c" in arg.lstrip("-"):
@@ -4648,6 +5666,11 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "preview_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},
                 "stdin": {**string, "default": ""},
                 "tty": {**boolean, "default": False},
+                "interactive": {
+                    **boolean,
+                    "default": False,
+                    "description": "Keep pipe-backed stdin open for later write_stdin calls; useful where tty is unavailable.",
+                },
                 "env": {"type": "object", "additionalProperties": {"type": "string"}, "default": {}},
             },
             ["cmd"],
@@ -4731,7 +5754,22 @@ def input_schemas() -> dict[str, dict[str, Any]]:
         ),
         "request_permissions": object_schema(
             {
-                "tool_name": {**string, "enum": ["exec_command", "apply_patch"]},
+                "tool_name": {
+                    **string,
+                    "enum": [
+                        "exec_command",
+                        "apply_patch",
+                        "read_file",
+                        "list_dir",
+                        "list_files",
+                        "search_text",
+                        "view_image",
+                        "computer_screenshot",
+                        "computer_mouse",
+                        "computer_keyboard",
+                        "computer_launch",
+                    ],
+                },
                 "permission": {
                     **string,
                     "enum": [
@@ -4743,6 +5781,8 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                         INLINE_SCRIPT_PERMISSION,
                         "privileged_executable",
                         "write_generated_or_ignored",
+                        "filesystem_read",
+                        "computer_control",
                     ],
                 },
                 "reason": {**string, "minLength": 1},
@@ -4759,6 +5799,54 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "max_width": {**integer, "minimum": 1, "maximum": 10000, "default": IMAGE_RESIZE_MAX_DIMENSION},
                 "max_height": {**integer, "minimum": 1, "maximum": 10000, "default": IMAGE_RESIZE_MAX_DIMENSION},
                 "auto_resize": {**boolean, "default": True},
+            },
+            ["path"],
+        ),
+        "computer_screenshot": object_schema(
+            {
+                "all_screens": {**boolean, "default": True},
+                "max_bytes": {**integer, "minimum": 1024, "maximum": 10485760, "default": 5242880},
+                "max_width": {**integer, "minimum": 320, "maximum": 10000, "default": 2000},
+                "max_height": {**integer, "minimum": 200, "maximum": 10000, "default": 2000},
+            }
+        ),
+        "computer_mouse": object_schema(
+            {
+                "action": {**string, "enum": ["move", "click", "scroll", "drag"]},
+                "x": {**integer, "minimum": -100000, "maximum": 100000},
+                "y": {**integer, "minimum": -100000, "maximum": 100000},
+                "to_x": {**integer, "minimum": -100000, "maximum": 100000},
+                "to_y": {**integer, "minimum": -100000, "maximum": 100000},
+                "button": {**string, "enum": ["left", "right", "middle"], "default": "left"},
+                "clicks": {**integer, "minimum": 1, "maximum": 3, "default": 1},
+                "interval_ms": {**integer, "minimum": 0, "maximum": 2000, "default": 100},
+                "delta": {**integer, "minimum": -100, "maximum": 100, "default": 0},
+                "duration_ms": {**integer, "minimum": 0, "maximum": 10000, "default": 300},
+            },
+            ["action"],
+        ),
+        "computer_keyboard": object_schema(
+            {
+                "action": {**string, "enum": ["type", "key", "hotkey"]},
+                "text": {**string, "maxLength": 10000},
+                "key": {**string, "minLength": 1, "maxLength": 32},
+                "keys": {
+                    "type": "array",
+                    "items": {**string, "minLength": 1, "maxLength": 32},
+                    "minItems": 1,
+                    "maxItems": 8,
+                },
+                "delay_ms": {**integer, "minimum": 0, "maximum": 1000, "default": 0},
+            },
+            ["action"],
+        ),
+        "computer_launch": object_schema(
+            {
+                "path": {**string, "minLength": 1},
+                "arguments": {"type": "array", "items": {"type": "string"}, "maxItems": 64},
+                "workdir": {**string, "default": "."},
+                "show": {**string, "enum": ["hidden", "normal", "minimized", "maximized"], "default": "normal"},
+                "wait_ms": {**integer, "minimum": 0, "maximum": 10000, "default": 750},
             },
             ["path"],
         ),
@@ -4795,6 +5883,9 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
             "name": SERVER_NAME,
             "title": SERVER_TITLE,
             "version": __version__,
+            "instanceId": runtime.server_instance_id,
+            "startedAt": runtime.started_at,
+            "pid": os.getpid(),
         },
         "transport": {
             "type": "streamable_http",
@@ -4805,12 +5896,20 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
         "tools": {
             "count": len(names),
             "names": names,
+            "catalogVersion": runtime.catalog_version,
             "readOnlyHintTrue": read_only,
             "readOnlyHintFalse": mutating,
             "annotationOverride": ("fake_readonly" if runtime.fake_readonly_annotations else None),
         },
         "capabilities": {
             "tools": {"listChanged": False},
+        },
+        "runtime": {
+            "state": "ready",
+            "workspace": str(runtime.workspace.root),
+            "serverInstanceId": runtime.server_instance_id,
+            "startedAt": runtime.started_at,
+            "pid": os.getpid(),
         },
     }
     return payload
@@ -4898,6 +5997,8 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             MCP_ENDPOINT_PATH,
             "/.well-known/mcp.json",
             "/.well-known/mcp/server-card.json",
+            "/healthz",
+            "/readyz",
             "/.well-known/oauth-authorization-server",
             "/.well-known/oauth-protected-resource",
             "/oauth/authorize",
@@ -4918,6 +6019,31 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
     def handle_metadata_request(self, *, head_only: bool) -> None:
         request_path = self.path.split("?", 1)[0]
         normalized = posixpath.normpath(request_path)
+        if normalized == "/healthz":
+            self.send_json(
+                {
+                    "ok": True,
+                    "state": "live",
+                    "server_instance_id": self.runtime.server_instance_id,
+                    "pid": os.getpid(),
+                },
+                head_only=head_only,
+            )
+            return
+        if normalized == "/readyz":
+            self.send_json(
+                {
+                    "ok": True,
+                    "state": "ready",
+                    "server_instance_id": self.runtime.server_instance_id,
+                    "workspace": str(self.runtime.workspace.root),
+                    "catalog_version": self.runtime.catalog_version,
+                    "tool_count": len(self.runtime.exposed_tool_names()),
+                    "pid": os.getpid(),
+                },
+                head_only=head_only,
+            )
+            return
         if normalized == "/.well-known/oauth-authorization-server":
             self.handle_oauth_as_metadata(head_only=head_only)
             return
@@ -5508,8 +6634,8 @@ class RuntimeHTTPServer(http.server.ThreadingHTTPServer):
         handler: type[MCPHandler],
         runtime: Runtime,
     ) -> None:
-        super().__init__(address, handler)
         self.runtime = runtime
+        super().__init__(address, handler)
 
     def server_close(self) -> None:
         self.runtime.close()
@@ -5530,7 +6656,10 @@ def build_runtime(
     workspace = Path(args.workspace or os.environ.get(f"{ENV_PREFIX}_WORKSPACE") or os.getcwd())
     runtime = Runtime(
         workspace,
+        read_roots=read_roots_from_args(args),
+        outside_read_policy=runtime_policy.outside_read_policy,
         enable_view_image=args.enable_view_image,
+        enable_computer_use=args.enable_computer_use,
         permission_mode=runtime_policy.permission_mode,
         shell_env_policy=runtime_policy.shell_env_policy,
         allow_network=runtime_policy.allow_network,
@@ -5538,6 +6667,7 @@ def build_runtime(
         oauth_config=oauth_config,
         project_context=project_context,
         fake_readonly_annotations=runtime_policy.fake_readonly_annotations,
+        allow_any_local_path=runtime_policy.allow_any_local_path,
         transport=transport,
         command_manager=command_manager,
     )
@@ -5551,6 +6681,13 @@ def build_runtime(
             "WARNING: tools/list reports every tool as read-only and non-destructive. "
             "apply_patch and exec_command still mutate the workspace and still run commands. "
             "server_info and the server card keep reporting the real annotations.",
+            file=sys.stderr,
+        )
+    if emit_warning and runtime.workspace.allow_any_local_path:
+        print(
+            "WARNING: authenticated callers may read and modify absolute paths on any local drive. "
+            "UNC and mapped-network paths, device/ADS/reserved-device paths, and relative parent escapes remain "
+            "blocked.",
             file=sys.stderr,
         )
     return runtime
@@ -5666,24 +6803,97 @@ def run_http(args: argparse.Namespace) -> int:
         )
         return 2
 
-    runtime = build_runtime(args, runtime_policy, auth_token=auth_token, oauth_config=oauth_config, transport="http")
-    server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime)
-    if oauth_config:
-        url_label = oauth_config.server_url or "dynamic request URL"
-        suffix = " + bearer" if runtime.auth_token else ""
-        auth_label = f"oauth2{suffix} enabled (server_url={url_label})"
-    elif runtime.auth_token:
-        auth_label = "bearer auth enabled"
-    else:
-        auth_label = "no auth configured"
-    base_url = _http_base_for_bind_host(str(args.host), args.port)
-    print(f"{SERVER_NAME} listening on {base_url}/mcp ({auth_label})", file=sys.stderr)
+    if runtime_policy.allow_any_local_path and not auth_token and not oauth_config:
+        print(
+            "ERROR: --dangerously-allow-any-local-path over HTTP requires --auth-token, "
+            f"{ENV_PREFIX}_AUTH_TOKEN, or --oauth-mode. "
+            "Anonymous loopback callers must never receive unrestricted filesystem access.",
+            file=sys.stderr,
+        )
+        return 2
+
+    workspace = Path(args.workspace or os.environ.get(f"{ENV_PREFIX}_WORKSPACE") or os.getcwd())
+    lease = HTTPInstanceLease(str(args.host), int(args.port), workspace)
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        return 130
+        lease.acquire()
+    except HTTPInstanceConflict as exc:
+        owner = {
+            key: exc.owner.get(key)
+            for key in ("state", "generation", "pid", "host", "port", "workspace", "server_instance_id")
+            if exc.owner.get(key) is not None
+        }
+        print(
+            json.dumps(
+                {
+                    "event": "server_startup_failed",
+                    "category": "instance_conflict",
+                    "phase": "acquire_lock",
+                    "retryable": False,
+                    "endpoint": f"{args.host}:{args.port}",
+                    "owner": owner,
+                    "recovery_hint": "Inspect the recorded owner; do not kill an unverified PID.",
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 98
+
+    runtime: Runtime | None = None
+    server: RuntimeHTTPServer | None = None
+    try:
+        runtime = build_runtime(
+            args,
+            runtime_policy,
+            auth_token=auth_token,
+            oauth_config=oauth_config,
+            transport="http",
+        )
+        try:
+            server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime)
+        except OSError:
+            runtime.close()
+            runtime = None
+            print(
+                json.dumps(
+                    {
+                        "event": "server_startup_failed",
+                        "category": "port_in_use",
+                        "phase": "bind",
+                        "retryable": False,
+                        "endpoint": f"{args.host}:{args.port}",
+                        "workspace": str(workspace.expanduser().resolve(strict=True)),
+                        "cause_type": "OSError",
+                        "recovery_hint": "Inspect the port owner and workspace identity; do not kill an unverified PID.",
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            return 98
+        lease.mark_ready(runtime)
+        if oauth_config:
+            url_label = oauth_config.server_url or "dynamic request URL"
+            suffix = " + bearer" if runtime.auth_token else ""
+            auth_label = f"oauth2{suffix} enabled (server_url={url_label})"
+        elif runtime.auth_token:
+            auth_label = "bearer auth enabled"
+        else:
+            auth_label = "no auth configured"
+        base_url = _http_base_for_bind_host(str(args.host), args.port)
+        print(f"{SERVER_NAME} listening on {base_url}/mcp ({auth_label})", file=sys.stderr)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            return 130
     finally:
-        server.server_close()
+        if server is not None:
+            server.server_close()
+        elif runtime is not None:
+            runtime.close()
+        lease.release()
     return 0
 
 
@@ -5692,6 +6902,12 @@ def run_stdio(args: argparse.Namespace) -> int:
         runtime_policy = runtime_policy_from_args(args)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if runtime_policy.allow_any_local_path:
+        print(
+            "ERROR: --dangerously-allow-any-local-path is only available over authenticated HTTP.",
+            file=sys.stderr,
+        )
         return 2
     runtime = build_runtime(args, runtime_policy)
     return serve_stdio(runtime)
@@ -5705,6 +6921,24 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"%(prog)s {__version__}",
     )
     parser.add_argument("--workspace", help="workspace root; defaults to CODING_TOOLS_MCP_WORKSPACE or cwd")
+    parser.add_argument(
+        "--read-root",
+        action="append",
+        default=[],
+        help=(
+            "additional read-only root for read_file, list_dir, list_files, search_text, and view_image; "
+            f"repeatable; {ENV_PREFIX}_READ_ROOTS uses the platform path separator"
+        ),
+    )
+    parser.add_argument(
+        "--outside-read-policy",
+        choices=OUTSIDE_READ_POLICY_CHOICES,
+        default=None,
+        help=(
+            "behavior for direct reads outside configured roots: deny or return a manual permission request; "
+            f"defaults to {ENV_PREFIX}_OUTSIDE_READ_POLICY or deny"
+        ),
+    )
     parser.add_argument(
         "--host",
         default=os.environ.get(f"{ENV_PREFIX}_HOST") or "127.0.0.1",
@@ -5766,6 +7000,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="enable the P1 view_image tool",
     )
     parser.add_argument(
+        "--enable-computer-use",
+        action="store_true",
+        default=truthy_env(os.environ.get(f"{ENV_PREFIX}_ENABLE_COMPUTER_USE")),
+        help=(
+            "enable Windows desktop screenshot/mouse/keyboard/launch tools; "
+            "trusted or dangerous permission mode is still required; UAC secure-desktop control is never enabled"
+        ),
+    )
+    parser.add_argument(
         "--dangerously-skip-all-permissions",
         action="store_true",
         help=(
@@ -5780,6 +7023,16 @@ def build_parser() -> argparse.ArgumentParser:
             "annotations; mutation and execution still happen; requires --permission-mode dangerous, and "
             "requires auth over HTTP; server_info and the server card keep reporting the real annotations; "
             f"can also be enabled with {ENV_PREFIX}_DANGEROUSLY_FAKE_READONLY_ANNOTATIONS=1"
+        ),
+    )
+    parser.add_argument(
+        "--dangerously-allow-any-local-path",
+        action="store_true",
+        help=(
+            "allow authenticated HTTP callers to use absolute paths on verified local drives for direct file/image "
+            "tools, apply_patch, exec_command workdir, git_status, and Computer Use launch paths; other Git helpers "
+            "remain workspace-repo scoped; requires --permission-mode dangerous; UNC/mapped-network/device/ADS "
+            f"paths remain blocked; can also be enabled with {ENV_PREFIX}_DANGEROUSLY_ALLOW_ANY_LOCAL_PATH=1"
         ),
     )
     return parser
